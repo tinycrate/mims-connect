@@ -21,8 +21,8 @@ import org.json.JSONException;
 import org.json.JSONObject;
 
 import javax.crypto.*;
+import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.PBEKeySpec;
-import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.net.URI;
@@ -37,8 +37,6 @@ import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-
-import static java.util.Collections.list;
 
 public class MimsConnect {
     /**
@@ -56,12 +54,22 @@ public class MimsConnect {
         void onDuplicated();
     }
 
+    /**
+     * Event handler for downloading existing key
+     * Register one using addListener();
+     */
     public interface DownloadKeyEventListener {
-        /**
-         *
-         */
-        void onSuccessfulImport();
+        /** The key is downloaded and imported successfully */
+        void onSuccessfulImport(String uuid);
+
+        /** The key fails to decrypt, probably caused by a wrong username / password */
+        void onFailedImport();
+
+        /** The key fails to download, or other error occurs */
+        void onError(Exception error);
     }
+
+    private final String TAG = "MimsConnect";
 
     private final URI apiUri;
     private final Context context;
@@ -77,13 +85,17 @@ public class MimsConnect {
     /* Api related constants */
     private final String ENDPOINT_REGISTER_UUID = "/register_uuid";
     private final String ENDPOINT_UPLOAD_KEYS = "/upload_keys";
+    private final String ENDPOINT_GET_SALT = "/get_key_salt";
+    private final String ENDPOINT_DOWNLOAD_KEYS = "/download_keys";
+    private final String ENDPOINT_REQUEST_PUBLIC_KEYS = "/request_public_keys";
 
     /* Key names for keystore retrieval */
     private final String KEY_ALIAS_ENC = "KEY_ALIAS_ENC";
     private final String KEY_ALIAS_SIGN = "KEY_ALIAS_SIGN";
 
     /* Event listeners */
-    private List<RegisterEventListener> registerEventListeners = new ArrayList<RegisterEventListener>();
+    private List<RegisterEventListener> registerEventListeners = new ArrayList<>();
+    private List<DownloadKeyEventListener> downloadKeyEventListeners = new ArrayList<>();
 
     /* User information */
     private String uuid = null;
@@ -114,12 +126,11 @@ public class MimsConnect {
      *
      * @return True if existing private key is present
      */
-    public boolean hasExistingKey()
+    public boolean hasStoredKeys()
             throws CertificateException, NoSuchAlgorithmException, IOException, KeyStoreException {
-        KeyStore ks = KeyStore.getInstance("AndroidKeyStore");
-        ks.load(null);
-        List<String> aliases = list(ks.aliases());
-        return aliases.containsAll(Arrays.asList(KEY_ALIAS_ENC, KEY_ALIAS_SIGN));
+        KeyStore keyStore = KeyStore.getInstance(KEYSTORE_ANDROID);
+        keyStore.load(null);
+        return keyStore.containsAlias(KEY_ALIAS_SIGN) && keyStore.containsAlias(KEY_ALIAS_ENC);
     }
 
     /**
@@ -128,7 +139,7 @@ public class MimsConnect {
      *
      * @throws NoSuchAlgorithmException Encryption scheme not supported by this client
      */
-    public void registerNewKey(final String username, final String password) {
+    public void registerNewKeys(final String username, final String password) {
         ExecutorService threadPool = Executors.newCachedThreadPool();
         threadPool.submit(new Runnable() {
             @Override
@@ -139,7 +150,7 @@ public class MimsConnect {
                     keygenEnc = KeyPairGenerator.getInstance(RSA_ENC_ALGRO);
                     keygenSign = KeyPairGenerator.getInstance(RSA_SIGN_ALGRO);
                 } catch (NoSuchAlgorithmException e) {
-                    e.printStackTrace();
+                    Log.e(TAG, "Error generating RSA keys", e);
                 }
                 keygenEnc.initialize(2048);
                 keygenSign.initialize(2048);
@@ -167,7 +178,7 @@ public class MimsConnect {
                                         onRegisterFailed(new RuntimeException("Unable to retrieve uuid from server"));
                                     }
                                 } catch (JSONException e) {
-                                    e.printStackTrace();
+                                    Log.e(TAG, "Error parsing key register response", e);
                                     onRegisterFailed(e);
                                 }
                             }
@@ -179,14 +190,13 @@ public class MimsConnect {
                 }) {
                     @Override
                     protected Map<String, String> getParams() {
-                        Map<String, String> params = new HashMap<String, String>();
+                        Map<String, String> params = new HashMap<>();
                         params.put("pks_pem", pksPem);
                         params.put("pke_pem", pkePem);
                         try {
                             params.put("rsa_sig", getSignature(new String[]{pksPem, pkePem}, keyPairSign.getPrivate()));
-                        } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException | KeyStoreException
-                                | CertificateException | IOException | UnrecoverableEntryException e) {
-                            e.printStackTrace();
+                        } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                            Log.e(TAG, "Error generating signature", e);
                         }
                         return params;
                     }
@@ -203,8 +213,8 @@ public class MimsConnect {
      */
     public boolean useStoredKeys() {
         try {
-            if (!hasExistingKey()) return false;
-            KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
+            if (!hasStoredKeys()) return false;
+            KeyStore keyStore = KeyStore.getInstance(KEYSTORE_ANDROID);
             keyStore.load(null);
             X509Certificate ce = (X509Certificate) keyStore.getCertificate(KEY_ALIAS_ENC);
             X509Certificate cs = (X509Certificate) keyStore.getCertificate(KEY_ALIAS_SIGN);
@@ -214,25 +224,81 @@ public class MimsConnect {
                 uuid = ceUuid;
                 return true;
             } else {
-                Log.e("MimsConnect", "Unable to use stored keys, encrypting and signing key uuid mismatch.");
+                Log.e(TAG, "Unable to use stored keys, encrypting and signing key uuid mismatch.");
                 return false;
             }
         } catch (CertificateException | NoSuchAlgorithmException | IOException | KeyStoreException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Error using stored keys", e);
             return false;
         }
     }
 
-    public void downloadExistingKey(String username, String password) {
-        throw new UnsupportedOperationException();
+
+    /**
+     * This deletes the private keys stored on the device
+     */
+    public void deleteStoredKeys() {
+        try {
+            KeyStore keyStore = KeyStore.getInstance(KEYSTORE_ANDROID);
+            keyStore.load(null);
+            keyStore.deleteEntry(KEY_ALIAS_ENC);
+        } catch (CertificateException | NoSuchAlgorithmException | IOException | KeyStoreException e) {
+            Log.i(TAG, "Encryption key cannot be deleted. Probably does not exist.");
+        }
+        try {
+            KeyStore keyStore = KeyStore.getInstance(KEYSTORE_ANDROID);
+            keyStore.load(null);
+            keyStore.deleteEntry(KEY_ALIAS_SIGN);
+        } catch (CertificateException | NoSuchAlgorithmException | IOException | KeyStoreException e) {
+            Log.i(TAG, "Signing key cannot be deleted. Probably does not exist.");
+        }
     }
 
-    public void addListener(RegisterEventListener listener) {
-        registerEventListeners.add(listener);
-    }
-
-    public void removeListener(RegisterEventListener listener) {
-        registerEventListeners.remove(listener);
+    public void downloadExistingKey(final String username, final String password) {
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                RequestQueue queue = Volley.newRequestQueue(context);
+                StringRequest req = new StringRequest(
+                        Request.Method.POST, apiUri.resolve(ENDPOINT_GET_SALT).toString(),
+                        new Response.Listener<String>() {
+                            @Override
+                            public void onResponse(String responseStr) {
+                                try {
+                                    JSONObject response = new JSONObject(responseStr);
+                                    if (response.getBoolean("successful")) {
+                                        onDownloadExistingKeys(
+                                                username,
+                                                password,
+                                                fromBase64(response.getString("salt"))
+                                        );
+                                    } else if (response.get("message").equals("nouser")) {
+                                        onDownloadKeyFailed();
+                                    } else {
+                                        onDownloadKeyError(new RuntimeException("Unable to retrieve salt from server"));
+                                    }
+                                } catch (JSONException e) {
+                                    Log.e(TAG, "Error parsing salt", e);
+                                    onDownloadKeyError(e);
+                                }
+                            }
+                        }, new Response.ErrorListener() {
+                    @Override
+                    public void onErrorResponse(VolleyError error) {
+                        onDownloadKeyError(error);
+                    }
+                }) {
+                    @Override
+                    protected Map<String, String> getParams() {
+                        Map<String, String> params = new HashMap<>();
+                        params.put("username", username);
+                        return params;
+                    }
+                };
+                queue.add(req);
+            }
+        });
     }
 
     /**
@@ -246,22 +312,21 @@ public class MimsConnect {
 
     private void onRegisterUploadKeys(final String uuid, final String username, final String password,
                                       final KeyPair keyEnc, final KeyPair keySign) {
-        Random r = new SecureRandom();
-        byte[] salt = new byte[32];
-        r.nextBytes(salt);
+        byte[] salt = generateBytes(32);
         SecretKey secretKey = null;
-        JSONObject keyObject;
+        byte[] keyObject;
         try {
             secretKey = deriveKey(password, salt);
             keyObject = buildPrivateKeyObject(secretKey, keyEnc.getPrivate(), keySign.getPrivate(), uuid);
         } catch (InvalidKeySpecException | IllegalBlockSizeException | InvalidKeyException | NoSuchPaddingException
-                | JSONException | NoSuchAlgorithmException e) {
-            e.printStackTrace();
+                | JSONException | NoSuchAlgorithmException | InvalidAlgorithmParameterException
+                | BadPaddingException e) {
+            Log.e(TAG, "Error encrypting keys", e);
             onRegisterFailed(e);
             return;
         }
         final String saltEncoded = toBase64(salt);
-        final String keyObjectEncoded = toBase64(keyObject.toString());
+        final String keyObjectEncoded = toBase64(keyObject);
         final String retrievalHash = toBase64(getSha256(secretKey.getEncoded()));
         RequestQueue queue = Volley.newRequestQueue(context);
         StringRequest req = new StringRequest(
@@ -282,7 +347,7 @@ public class MimsConnect {
                                 onRegisterFailed(new RuntimeException("Unable to register key on server"));
                             }
                         } catch (JSONException e) {
-                            e.printStackTrace();
+                            Log.e(TAG, "Error parsing upload key response", e);
                             onRegisterFailed(e);
                         }
                     }
@@ -294,7 +359,7 @@ public class MimsConnect {
         }) {
             @Override
             protected Map<String, String> getParams() throws AuthFailureError {
-                Map<String, String> params = new HashMap<String, String>();
+                Map<String, String> params = new HashMap<>();
                 params.put("username", username);
                 params.put("keys", keyObjectEncoded);
                 params.put("retrieval_hash", retrievalHash);
@@ -303,9 +368,8 @@ public class MimsConnect {
                     params.put("rsa_sig", getSignature(new String[]{
                             username, keyObjectEncoded, retrievalHash, saltEncoded
                     }, getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)));
-                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException | KeyStoreException
-                        | CertificateException | IOException | UnrecoverableEntryException e) {
-                    e.printStackTrace();
+                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                    Log.e(TAG, "Error generating signature", e);
                 }
                 return params;
             }
@@ -318,22 +382,124 @@ public class MimsConnect {
         queue.add(req);
     }
 
-    private void onRegisterSuccessful(String uuid) {
-        for (RegisterEventListener listener : registerEventListeners) {
-            listener.onSuccess(uuid);
+    private void onDownloadExistingKeys(final String username, String password, byte[] salt) {
+        final SecretKey secretKey;
+        try {
+            secretKey = deriveKey(password, salt);
+        } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
+            Log.e(TAG, "Error deriving key", e);
+            onDownloadKeyError(e);
+            return;
+        }
+        final String retrievalHash = toBase64(getSha256(secretKey.getEncoded()));
+        RequestQueue queue = Volley.newRequestQueue(context);
+        StringRequest req = new StringRequest(
+                Request.Method.POST, apiUri.resolve(ENDPOINT_DOWNLOAD_KEYS).toString(),
+                new Response.Listener<String>() {
+                    @Override
+                    public void onResponse(String responseStr) {
+                        try {
+                            JSONObject response = new JSONObject(responseStr);
+                            if (response.getBoolean("successful")) {
+                                onParseDownloadedKeys(secretKey, response.getString("keys"));
+                            } else if (response.getString("message").equals("noentries")) {
+                                onDownloadKeyFailed();
+                            } else {
+                                onDownloadKeyError(new RuntimeException("Unable to retrieve keys from server"));
+                            }
+                        } catch (JSONException e) {
+                            Log.e(TAG, "Error parsing response", e);
+                            onDownloadKeyError(e);
+                        }
+                    }
+                }, new Response.ErrorListener() {
+            @Override
+            public void onErrorResponse(VolleyError error) {
+                onDownloadKeyError(error);
+            }
+        }) {
+            @Override
+            protected Map<String, String> getParams() {
+                Map<String, String> params = new HashMap<>();
+                params.put("username", username);
+                params.put("retrieval_hash", retrievalHash);
+                return params;
+            }
+        };
+        queue.add(req);
+    }
+
+    private void onParseDownloadedKeys(SecretKey secretKey, String b64Keys) {
+        JSONObject privateKeyObject = null;
+        try {
+            privateKeyObject = decryptPrivateKeyObject(secretKey, fromBase64(b64Keys));
+            PrivateKey enc = unwrapPrivateKey(
+                    secretKey,
+                    fromBase64(privateKeyObject.getString("ske")),
+                    RSA_ENC_ALGRO
+            );
+            PrivateKey sign = unwrapPrivateKey(
+                    secretKey,
+                    fromBase64(privateKeyObject.getString("sks")),
+                    RSA_SIGN_ALGRO
+            );
+            String uuid = privateKeyObject.getString("uuid");
+            onImportDownloadedKeys(enc, sign, uuid);
+        } catch (JSONException | NoSuchPaddingException | InvalidAlgorithmParameterException | NoSuchAlgorithmException
+                | IllegalBlockSizeException | BadPaddingException | InvalidKeyException e) {
+            Log.e(TAG, "Error parsing retrieved keys", e);
+            onDownloadKeyError(e);
+            return;
         }
     }
 
-    private void onRegisterFailed(Exception e) {
-        for (RegisterEventListener listener : registerEventListeners) {
-            listener.onFailure(e);
-        }
-    }
-
-    private void onRegisterUsernameDuplicated() {
-        for (RegisterEventListener listener : registerEventListeners) {
-            listener.onDuplicated();
-        }
+    private void onImportDownloadedKeys(final PrivateKey encKey, final PrivateKey signKey, final String uuid) {
+        RequestQueue queue = Volley.newRequestQueue(context);
+        StringRequest req = new StringRequest(
+                Request.Method.POST, apiUri.resolve(ENDPOINT_REQUEST_PUBLIC_KEYS).toString(),
+                new Response.Listener<String>() {
+                    @Override
+                    public void onResponse(String responseStr) {
+                        try {
+                            JSONObject response = new JSONObject(responseStr);
+                            if (response.getBoolean("successful")) {
+                                JSONObject keys =  response.getJSONObject("keys");
+                                PublicKey encPublic = fromPem(keys.getString("pke"), RSA_ENC_ALGRO);
+                                PublicKey signPublic = fromPem(keys.getString("pks"), RSA_SIGN_ALGRO);
+                                KeyPair encPair = new KeyPair(encPublic, encKey);
+                                KeyPair signPair = new KeyPair(signPublic, signKey);
+                                storeKeyInKeystore(encPair, KEY_ALIAS_ENC, uuid);
+                                storeKeyInKeystore(signPair, KEY_ALIAS_SIGN, uuid);
+                                MimsConnect.this.uuid = uuid;
+                                onDownloadKeySuccessful(uuid);
+                            } else {
+                                onDownloadKeyError(new RuntimeException("Unable to retrieve public keys from server"));
+                            }
+                        } catch (JSONException | NoSuchAlgorithmException | InvalidKeySpecException e) {
+                            Log.e(TAG, "Error parsing response", e);
+                            onDownloadKeyError(e);
+                        }
+                    }
+                }, new Response.ErrorListener() {
+            @Override
+            public void onErrorResponse(VolleyError error) {
+                onDownloadKeyError(error);
+            }
+        }) {
+            @Override
+            protected Map<String, String> getParams() {
+                Map<String, String> params = new HashMap<>();
+                params.put("requesting_uuid", uuid);
+                params.put("requester_uuid", uuid);
+                try {
+                    params.put("rsa_sig", getSignature(new String[]{uuid, uuid}, signKey));
+                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                    Log.e(TAG, "Error generating signature", e);
+                }
+                return params;
+            }
+        };
+        queue.add(req);
     }
 
     private SecretKey deriveKey(String password, byte[] salt) throws NoSuchAlgorithmException, InvalidKeySpecException {
@@ -343,30 +509,76 @@ public class MimsConnect {
     }
 
     private byte[] wrapPrivateKey(SecretKey encryptKey, PrivateKey keyBeingWraped)
-            throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException, IllegalBlockSizeException {
-        SecretKeySpec spec = new SecretKeySpec(encryptKey.getEncoded(), "AES");
+            throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException, IllegalBlockSizeException,
+            InvalidAlgorithmParameterException {
+        byte[] iv = generateBytes(12);
+        GCMParameterSpec spec = new GCMParameterSpec(128, iv);
         Cipher cipher = Cipher.getInstance(ENCRYPT_ALGRO);
-        cipher.init(Cipher.WRAP_MODE, spec);
-        return cipher.wrap(keyBeingWraped);
+        cipher.init(Cipher.WRAP_MODE, encryptKey, spec);
+        return concatBytes(iv, cipher.wrap(keyBeingWraped));
     }
 
     private PrivateKey unwrapPrivateKey(SecretKey decryptKey, byte[] keyBeingUnwraped, String unwrapKeyAlgro)
-            throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException {
-        SecretKeySpec spec = new SecretKeySpec(decryptKey.getEncoded(), "AES");
+            throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException,
+            InvalidAlgorithmParameterException {
+        GCMParameterSpec spec = new GCMParameterSpec(128, keyBeingUnwraped, 0, 12);
         Cipher cipher = Cipher.getInstance(ENCRYPT_ALGRO);
-        cipher.init(Cipher.UNWRAP_MODE, spec);
-        return (PrivateKey) cipher.unwrap(keyBeingUnwraped, unwrapKeyAlgro, Cipher.PRIVATE_KEY);
+        cipher.init(Cipher.UNWRAP_MODE, decryptKey, spec);
+        return (PrivateKey) cipher.unwrap(
+                Arrays.copyOfRange(keyBeingUnwraped, 12, keyBeingUnwraped.length),
+                unwrapKeyAlgro,
+                Cipher.PRIVATE_KEY
+        );
     }
 
-    private JSONObject buildPrivateKeyObject(
+    private byte[] encryptWithKey(SecretKey key, byte[] bytesBeingEncrypted)
+            throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException, BadPaddingException,
+            IllegalBlockSizeException, InvalidAlgorithmParameterException {
+        byte[] iv = generateBytes(12);
+        GCMParameterSpec spec = new GCMParameterSpec(128, iv);
+        Cipher cipher = Cipher.getInstance(ENCRYPT_ALGRO);
+        cipher.init(Cipher.ENCRYPT_MODE, key, spec);
+        return concatBytes(iv, cipher.doFinal(bytesBeingEncrypted));
+    }
+
+    private byte[] decryptWithKey(SecretKey key, byte[] bytesBeingDecrypted)
+            throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException,
+            InvalidAlgorithmParameterException, BadPaddingException, IllegalBlockSizeException {
+        GCMParameterSpec spec = new GCMParameterSpec(128, bytesBeingDecrypted, 0, 12);
+        Cipher cipher = Cipher.getInstance(ENCRYPT_ALGRO);
+        cipher.init(Cipher.UNWRAP_MODE, key, spec);
+        return cipher.doFinal(bytesBeingDecrypted, 12, bytesBeingDecrypted.length - 12);
+    }
+
+    private byte[] buildPrivateKeyObject(
             SecretKey secretKey, PrivateKey rsaEncryptKey, PrivateKey rsaSignKey, String uuid)
             throws IllegalBlockSizeException, InvalidKeyException, NoSuchAlgorithmException, NoSuchPaddingException,
-            JSONException {
+            JSONException, InvalidAlgorithmParameterException, BadPaddingException {
         JSONObject json = new JSONObject();
         json.put("ske", toBase64(wrapPrivateKey(secretKey, rsaEncryptKey)));
         json.put("sks", toBase64(wrapPrivateKey(secretKey, rsaSignKey)));
         json.put("uuid", uuid);
-        return json;
+        return encryptWithKey(secretKey, json.toString().getBytes());
+    }
+
+    private JSONObject decryptPrivateKeyObject(SecretKey key, byte[] encryptedObject)
+            throws NoSuchPaddingException, InvalidAlgorithmParameterException, NoSuchAlgorithmException,
+            IllegalBlockSizeException, BadPaddingException, InvalidKeyException, JSONException {
+        return new JSONObject(new String(decryptWithKey(key, encryptedObject), StandardCharsets.UTF_8));
+    }
+
+    private byte[] generateBytes(int size) {
+        Random r = new SecureRandom();
+        byte[] bytes = new byte[size];
+        r.nextBytes(bytes);
+        return bytes;
+    }
+
+    private byte[] concatBytes(byte[] a, byte[] b) {
+        byte[] c = new byte[a.length + b.length];
+        System.arraycopy(a, 0, c, 0, a.length);
+        System.arraycopy(b, 0, c, a.length, b.length);
+        return c;
     }
 
     private byte[] getSha256(byte[] bytes) {
@@ -374,7 +586,7 @@ public class MimsConnect {
         try {
             digest = MessageDigest.getInstance("SHA-256");
         } catch (NoSuchAlgorithmException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Error getting sha256", e);
             return null;
         }
         return digest.digest(bytes);
@@ -386,7 +598,7 @@ public class MimsConnect {
         }
         KeyStore keyStore = null;
         try {
-            keyStore = KeyStore.getInstance("AndroidKeyStore");
+            keyStore = KeyStore.getInstance(KEYSTORE_ANDROID);
             keyStore.load(null);
             if (keyAlias.equals(KEY_ALIAS_ENC)) {
                 keyStore.setEntry(
@@ -410,7 +622,7 @@ public class MimsConnect {
             }
         } catch (KeyStoreException | CertificateException | IOException | NoSuchAlgorithmException
                 | OperatorCreationException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Error storing keys in keystore", e);
             return false;
         }
         return true;
@@ -419,12 +631,12 @@ public class MimsConnect {
     private PrivateKey getPrivateKeyFromKeystore(String keyAlias) {
         KeyStore keyStore = null;
         try {
-            keyStore = KeyStore.getInstance("AndroidKeyStore");
+            keyStore = KeyStore.getInstance(KEYSTORE_ANDROID);
             keyStore.load(null);
             return (PrivateKey) keyStore.getKey(keyAlias, null);
         } catch (KeyStoreException | CertificateException | IOException | NoSuchAlgorithmException
                 | UnrecoverableKeyException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Error retrieving keys", e);
             return null;
         }
     }
@@ -432,7 +644,7 @@ public class MimsConnect {
     private PublicKey getPublicKeyFromKeystore(String keyAlias) {
         KeyStore keyStore = null;
         try {
-            keyStore = KeyStore.getInstance("AndroidKeyStore");
+            keyStore = KeyStore.getInstance(KEYSTORE_ANDROID);
             keyStore.load(null);
             java.security.cert.Certificate c = keyStore.getCertificate(keyAlias);
             if (c == null) return null;
@@ -444,7 +656,7 @@ public class MimsConnect {
             );
         } catch (KeyStoreException | CertificateException | IOException | NoSuchAlgorithmException
                 | InvalidKeySpecException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Error retrieving keys", e);
             return null;
         }
 
@@ -489,8 +701,7 @@ public class MimsConnect {
      * @throws SignatureException       Signing failed
      */
     private String getSignature(String[] params, PrivateKey privateSignKey)
-            throws NoSuchAlgorithmException, InvalidKeyException, SignatureException, KeyStoreException,
-            CertificateException, IOException, UnrecoverableEntryException {
+            throws NoSuchAlgorithmException, InvalidKeyException, SignatureException {
         Arrays.sort(params); // Server requires the params to be sorted first
         Signature signature = Signature.getInstance(RSA_SIGN_SCHEME);
         signature.initSign(privateSignKey);
@@ -501,17 +712,21 @@ public class MimsConnect {
     }
 
     private static String toBase64(byte[] bytes) {
-        return android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP);
+        return Base64.encodeToString(bytes, Base64.NO_WRAP);
     }
 
     private static String toBase64(String str) {
         return toBase64(str.getBytes(StandardCharsets.UTF_8));
     }
 
+    private static byte[] fromBase64(String base64) {
+        return Base64.decode(base64, Base64.DEFAULT);
+    }
+
     private static String toPem(PublicKey key) {
         StringBuilder pem = new StringBuilder();
         pem.append("-----BEGIN PUBLIC KEY-----");
-        String encoded = android.util.Base64.encodeToString(key.getEncoded(), android.util.Base64.NO_WRAP);
+        String encoded = Base64.encodeToString(key.getEncoded(), Base64.NO_WRAP);
         for (int i = 0; i < encoded.length(); i++) {
             if (i % 64 == 0) {
                 pem.append('\n');
@@ -526,9 +741,61 @@ public class MimsConnect {
             throws NoSuchAlgorithmException, InvalidKeySpecException {
         pem = pem.replace("-----BEGIN PUBLIC KEY-----\n", "")
                 .replace("-----END PUBLIC KEY-----", "");
-        byte[] decoded = android.util.Base64.decode(pem, Base64.DEFAULT);
+        byte[] decoded = Base64.decode(pem, Base64.DEFAULT);
         X509EncodedKeySpec spec = new X509EncodedKeySpec(decoded);
         KeyFactory keyFactory = KeyFactory.getInstance(algorithm);
         return keyFactory.generatePublic(spec);
+    }
+
+    public void addListener(RegisterEventListener listener) {
+        registerEventListeners.add(listener);
+    }
+
+    public void addListener(DownloadKeyEventListener listener) {
+        downloadKeyEventListeners.add(listener);
+    }
+
+    public void removeListener(RegisterEventListener listener) {
+        registerEventListeners.remove(listener);
+    }
+
+    public void removeListener(DownloadKeyEventListener listener) {
+        downloadKeyEventListeners.remove(listener);
+    }
+
+    private void onRegisterSuccessful(String uuid) {
+        for (RegisterEventListener listener : registerEventListeners) {
+            listener.onSuccess(uuid);
+        }
+    }
+
+    private void onRegisterFailed(Exception e) {
+        for (RegisterEventListener listener : registerEventListeners) {
+            listener.onFailure(e);
+        }
+    }
+
+    private void onRegisterUsernameDuplicated() {
+        for (RegisterEventListener listener : registerEventListeners) {
+            listener.onDuplicated();
+        }
+    }
+
+    private void onDownloadKeySuccessful(String uuid) {
+        for (DownloadKeyEventListener listener : downloadKeyEventListeners) {
+            listener.onSuccessfulImport(uuid);
+        }
+    }
+
+    private void onDownloadKeyFailed() {
+        for (DownloadKeyEventListener listener : downloadKeyEventListeners) {
+            listener.onFailedImport();
+        }
+    }
+
+    private void onDownloadKeyError(Exception e) {
+        for (DownloadKeyEventListener listener : downloadKeyEventListeners) {
+            listener.onError(e);
+        }
     }
 }
