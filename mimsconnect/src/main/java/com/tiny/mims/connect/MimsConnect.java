@@ -5,6 +5,7 @@ import android.security.keystore.KeyProperties;
 import android.security.keystore.KeyProtection;
 import android.text.TextUtils;
 import android.util.Base64;
+import android.util.Log;
 import com.android.volley.*;
 import com.android.volley.toolbox.StringRequest;
 import com.android.volley.toolbox.Volley;
@@ -30,9 +31,12 @@ import java.nio.charset.StandardCharsets;
 import java.security.*;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static java.util.Collections.list;
 
@@ -124,66 +128,103 @@ public class MimsConnect {
      *
      * @throws NoSuchAlgorithmException Encryption scheme not supported by this client
      */
-    public void registerNewKey(final String username, final String password)
-            throws NoSuchAlgorithmException, NoSuchProviderException {
-        KeyPairGenerator keygenEnc = KeyPairGenerator.getInstance(RSA_ENC_ALGRO);
-        KeyPairGenerator keygenSign = KeyPairGenerator.getInstance(RSA_SIGN_ALGRO);
-        keygenEnc.initialize(2048);
-        keygenSign.initialize(2048);
-        final KeyPair keyPairEnc = keygenEnc.generateKeyPair();
-        final KeyPair keyPairSign = keygenSign.generateKeyPair();
-        final String pksPem = toBase64(toPem(keyPairSign.getPublic()));
-        final String pkePem = toBase64(toPem(keyPairEnc.getPublic()));
-        RequestQueue queue = Volley.newRequestQueue(context);
-        StringRequest req = new StringRequest(
-                Request.Method.POST, apiUri.resolve(ENDPOINT_REGISTER_UUID).toString(),
-                new Response.Listener<String>() {
-                    @Override
-                    public void onResponse(String responseStr) {
-                        try {
-                            JSONObject response = new JSONObject(responseStr);
-                            if (response.getBoolean("successful")) {
-                                onRegisterUploadKeys(
-                                        response.getString("uuid"),
-                                        username,
-                                        password,
-                                        keyPairEnc,
-                                        keyPairSign
-                                );
-                            } else {
-                                onRegisterFailed(new RuntimeException("Unable to retrieve uuid from server"));
-                            }
-                        } catch (JSONException e) {
-                            e.printStackTrace();
-                            onRegisterFailed(e);
-                        }
-                    }
-                }, new Response.ErrorListener() {
+    public void registerNewKey(final String username, final String password) {
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        threadPool.submit(new Runnable() {
             @Override
-            public void onErrorResponse(VolleyError error) {
-                onRegisterFailed(error);
-            }
-        }) {
-            @Override
-            protected Map<String, String> getParams() {
-                Map<String, String> params = new HashMap<String, String>();
-                params.put("pks_pem", pksPem);
-                params.put("pke_pem", pkePem);
+            public void run() {
+                KeyPairGenerator keygenEnc = null;
+                KeyPairGenerator keygenSign = null;
                 try {
-                    params.put("rsa_sig", getSignature(new String[]{pksPem, pkePem}, keyPairSign.getPrivate()));
-                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException | KeyStoreException
-                        | CertificateException | IOException | UnrecoverableEntryException e) {
+                    keygenEnc = KeyPairGenerator.getInstance(RSA_ENC_ALGRO);
+                    keygenSign = KeyPairGenerator.getInstance(RSA_SIGN_ALGRO);
+                } catch (NoSuchAlgorithmException e) {
                     e.printStackTrace();
                 }
-                return params;
+                keygenEnc.initialize(2048);
+                keygenSign.initialize(2048);
+                final KeyPair keyPairEnc = keygenEnc.generateKeyPair();
+                final KeyPair keyPairSign = keygenSign.generateKeyPair();
+                final String pksPem = toBase64(toPem(keyPairSign.getPublic()));
+                final String pkePem = toBase64(toPem(keyPairEnc.getPublic()));
+                RequestQueue queue = Volley.newRequestQueue(context);
+                StringRequest req = new StringRequest(
+                        Request.Method.POST, apiUri.resolve(ENDPOINT_REGISTER_UUID).toString(),
+                        new Response.Listener<String>() {
+                            @Override
+                            public void onResponse(String responseStr) {
+                                try {
+                                    JSONObject response = new JSONObject(responseStr);
+                                    if (response.getBoolean("successful")) {
+                                        onRegisterUploadKeys(
+                                                response.getString("uuid"),
+                                                username,
+                                                password,
+                                                keyPairEnc,
+                                                keyPairSign
+                                        );
+                                    } else {
+                                        onRegisterFailed(new RuntimeException("Unable to retrieve uuid from server"));
+                                    }
+                                } catch (JSONException e) {
+                                    e.printStackTrace();
+                                    onRegisterFailed(e);
+                                }
+                            }
+                        }, new Response.ErrorListener() {
+                    @Override
+                    public void onErrorResponse(VolleyError error) {
+                        onRegisterFailed(error);
+                    }
+                }) {
+                    @Override
+                    protected Map<String, String> getParams() {
+                        Map<String, String> params = new HashMap<String, String>();
+                        params.put("pks_pem", pksPem);
+                        params.put("pke_pem", pkePem);
+                        try {
+                            params.put("rsa_sig", getSignature(new String[]{pksPem, pkePem}, keyPairSign.getPrivate()));
+                        } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException | KeyStoreException
+                                | CertificateException | IOException | UnrecoverableEntryException e) {
+                            e.printStackTrace();
+                        }
+                        return params;
+                    }
+                };
+                queue.add(req);
             }
-        };
-        queue.add(req);
+        });
+    }
+
+    /**
+     * Use the currently stored key in the keystore and set their respective uuid (i.e log in)
+     *
+     * @return true if the keys are successfully loaded
+     */
+    public boolean useStoredKeys() {
+        try {
+            if (!hasExistingKey()) return false;
+            KeyStore keyStore = KeyStore.getInstance("AndroidKeyStore");
+            keyStore.load(null);
+            X509Certificate ce = (X509Certificate) keyStore.getCertificate(KEY_ALIAS_ENC);
+            X509Certificate cs = (X509Certificate) keyStore.getCertificate(KEY_ALIAS_SIGN);
+            String ceUuid = ce.getSubjectDN().getName().replace("CN=", "");
+            String csUuid = cs.getSubjectDN().getName().replace("CN=", "");
+            if (ceUuid.equals(csUuid)) {
+                uuid = ceUuid;
+                return true;
+            } else {
+                Log.e("MimsConnect", "Unable to use stored keys, encrypting and signing key uuid mismatch.");
+                return false;
+            }
+        } catch (CertificateException | NoSuchAlgorithmException | IOException | KeyStoreException e) {
+            e.printStackTrace();
+            return false;
+        }
     }
 
     public void downloadExistingKey(String username, String password) {
-
-
+        throw new UnsupportedOperationException();
     }
 
     public void addListener(RegisterEventListener listener) {
@@ -231,8 +272,8 @@ public class MimsConnect {
                         try {
                             JSONObject response = new JSONObject(responseStr);
                             if (response.getBoolean("successful")) {
-                                storeKey(keyEnc, KEY_ALIAS_ENC);
-                                storeKey(keySign, KEY_ALIAS_SIGN);
+                                storeKeyInKeystore(keyEnc, KEY_ALIAS_ENC, uuid);
+                                storeKeyInKeystore(keySign, KEY_ALIAS_SIGN, uuid);
                                 MimsConnect.this.uuid = uuid;
                                 onRegisterSuccessful(uuid);
                             } else if (response.getString("message").equals("duplicated")) {
@@ -324,6 +365,7 @@ public class MimsConnect {
         JSONObject json = new JSONObject();
         json.put("ske", toBase64(wrapPrivateKey(secretKey, rsaEncryptKey)));
         json.put("sks", toBase64(wrapPrivateKey(secretKey, rsaSignKey)));
+        json.put("uuid", uuid);
         return json;
     }
 
@@ -338,7 +380,7 @@ public class MimsConnect {
         return digest.digest(bytes);
     }
 
-    private boolean storeKey(KeyPair keyPair, String keyAlias) {
+    private boolean storeKeyInKeystore(KeyPair keyPair, String keyAlias, String uuid) {
         if (!Objects.equals(keyAlias, KEY_ALIAS_ENC) && !keyAlias.equals(KEY_ALIAS_SIGN)) {
             return false;
         }
@@ -350,7 +392,7 @@ public class MimsConnect {
                 keyStore.setEntry(
                         KEY_ALIAS_ENC,
                         new KeyStore.PrivateKeyEntry(keyPair.getPrivate(),
-                                new java.security.cert.Certificate[]{genSelfSignedCert(keyPair, KEY_ALIAS_ENC)}),
+                                new java.security.cert.Certificate[]{genSelfSignedCert(keyPair, KEY_ALIAS_ENC, uuid)}),
                         new KeyProtection.Builder(KeyProperties.PURPOSE_DECRYPT)
                                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
                                 .build()
@@ -359,7 +401,7 @@ public class MimsConnect {
                 keyStore.setEntry(
                         KEY_ALIAS_SIGN,
                         new KeyStore.PrivateKeyEntry(keyPair.getPrivate(),
-                                new java.security.cert.Certificate[]{genSelfSignedCert(keyPair, KEY_ALIAS_SIGN)}),
+                                new java.security.cert.Certificate[]{genSelfSignedCert(keyPair, KEY_ALIAS_SIGN, uuid)}),
                         new KeyProtection.Builder(KeyProperties.PURPOSE_SIGN)
                                 .setDigests(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512)
                                 .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PSS)
@@ -410,9 +452,9 @@ public class MimsConnect {
 
     /**
      * This is for use with the Android Keystore
-     * keyAlias is used to name that certificate
+     * The UUID is used to name that certificate for later retrieval
      */
-    private Certificate genSelfSignedCert(KeyPair keyPair, String keyAlias)
+    private Certificate genSelfSignedCert(KeyPair keyPair, String keyAlias, String uuid)
             throws OperatorCreationException, CertificateException {
         Provider bcProvider = new BouncyCastleProvider();
         Security.addProvider(bcProvider);
@@ -421,7 +463,7 @@ public class MimsConnect {
         calendar.setTime(currentDate);
         calendar.add(Calendar.YEAR, 100);
         Date expireDate = calendar.getTime();
-        X500Name dnName = new X500Name("CN=" + keyAlias);
+        X500Name dnName = new X500Name("CN=" + uuid);
         JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
                 dnName,
                 new BigInteger(Long.toString(currentDate.getTime())),
