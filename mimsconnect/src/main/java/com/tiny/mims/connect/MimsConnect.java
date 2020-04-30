@@ -1,12 +1,14 @@
 package com.tiny.mims.connect;
 
 import android.content.Context;
+import android.os.Looper;
 import android.security.keystore.KeyProperties;
 import android.security.keystore.KeyProtection;
 import android.text.TextUtils;
 import android.util.Base64;
 import android.util.Log;
 import com.android.volley.*;
+import com.android.volley.toolbox.RequestFuture;
 import com.android.volley.toolbox.StringRequest;
 import com.android.volley.toolbox.Volley;
 import org.bouncycastle.asn1.x500.X500Name;
@@ -35,8 +37,7 @@ import java.security.cert.X509Certificate;
 import java.security.spec.InvalidKeySpecException;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.*;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 
 public class MimsConnect {
     /**
@@ -69,6 +70,44 @@ public class MimsConnect {
         void onError(Exception error);
     }
 
+    /**
+     * Event handler for sending message
+     * Register one using addListener();
+     */
+    public interface SendMessageEventListener {
+        /**
+         * The message is sent successfully
+         *
+         * @param messageId The id of the message
+         */
+        void onSent(String messageId);
+
+        /**
+         * Error occurred while sending. It could be a network error
+         *
+         * @param messageId The id of the message
+         * @param error     The error
+         */
+        void onFailed(String messageId, Exception error);
+
+        /**
+         * The recipient of the message does not exist
+         *
+         * @param messageId The id of the message
+         */
+        void onFailedNoUser(String messageId);
+    }
+
+    public static class PublicKeys {
+        public PublicKey publicEncryptKey;
+        public PublicKey publicSignKey;
+
+        public PublicKeys(PublicKey publicEncryptKey, PublicKey publicSignKey) {
+            this.publicEncryptKey = publicEncryptKey;
+            this.publicSignKey = publicSignKey;
+        }
+    }
+
     private final String TAG = "MimsConnect";
 
     private final URI apiUri;
@@ -88,6 +127,7 @@ public class MimsConnect {
     private final String ENDPOINT_GET_SALT = "/get_key_salt";
     private final String ENDPOINT_DOWNLOAD_KEYS = "/download_keys";
     private final String ENDPOINT_REQUEST_PUBLIC_KEYS = "/request_public_keys";
+    private final String ENDPOINT_SEND_MESSAGE = "/send_message";
 
     /* Key names for keystore retrieval */
     private final String KEY_ALIAS_ENC = "KEY_ALIAS_ENC";
@@ -96,9 +136,16 @@ public class MimsConnect {
     /* Event listeners */
     private List<RegisterEventListener> registerEventListeners = new ArrayList<>();
     private List<DownloadKeyEventListener> downloadKeyEventListeners = new ArrayList<>();
+    private List<SendMessageEventListener> sendMessageEventListeners = new ArrayList<>();
 
     /* User information */
     private String uuid = null;
+
+    /* Volley queue */
+    private final RequestQueue requestQueue;
+
+    /* Cache */
+    private ConcurrentHashMap<String, PublicKeys> publicKeyCache = new ConcurrentHashMap<>();
 
     /**
      * Creates an instance to connect and interface with the MIMS server
@@ -118,6 +165,7 @@ public class MimsConnect {
         }
         this.apiUri = new URI(apiUrl);
         this.context = context;
+        this.requestQueue = Volley.newRequestQueue(context);
     }
 
     /**
@@ -156,9 +204,16 @@ public class MimsConnect {
                 keygenSign.initialize(2048);
                 final KeyPair keyPairEnc = keygenEnc.generateKeyPair();
                 final KeyPair keyPairSign = keygenSign.generateKeyPair();
-                final String pksPem = toBase64(toPem(keyPairSign.getPublic()));
-                final String pkePem = toBase64(toPem(keyPairEnc.getPublic()));
-                RequestQueue queue = Volley.newRequestQueue(context);
+                final String pksPem = toPem(keyPairSign.getPublic());
+                final String pkePem = toPem(keyPairEnc.getPublic());
+                final String rsaSig;
+                try {
+                    rsaSig = getSignature(new String[]{pksPem, pkePem}, keyPairSign.getPrivate());
+                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                    Log.e(TAG, "Error generating signature", e);
+                    onRegisterFailed(e);
+                    return;
+                }
                 StringRequest req = new StringRequest(
                         Request.Method.POST, apiUri.resolve(ENDPOINT_REGISTER_UUID).toString(),
                         new Response.Listener<String>() {
@@ -193,15 +248,11 @@ public class MimsConnect {
                         Map<String, String> params = new HashMap<>();
                         params.put("pks_pem", pksPem);
                         params.put("pke_pem", pkePem);
-                        try {
-                            params.put("rsa_sig", getSignature(new String[]{pksPem, pkePem}, keyPairSign.getPrivate()));
-                        } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
-                            Log.e(TAG, "Error generating signature", e);
-                        }
+                        params.put("rsa_sig", rsaSig);
                         return params;
                     }
                 };
-                queue.add(req);
+                requestQueue.add(req);
             }
         });
     }
@@ -233,7 +284,6 @@ public class MimsConnect {
         }
     }
 
-
     /**
      * This deletes the private keys stored on the device
      */
@@ -260,7 +310,6 @@ public class MimsConnect {
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
-                RequestQueue queue = Volley.newRequestQueue(context);
                 StringRequest req = new StringRequest(
                         Request.Method.POST, apiUri.resolve(ENDPOINT_GET_SALT).toString(),
                         new Response.Listener<String>() {
@@ -297,9 +346,97 @@ public class MimsConnect {
                         return params;
                     }
                 };
-                queue.add(req);
+                requestQueue.add(req);
             }
         });
+    }
+
+    /**
+     * Sends a message to a user, returns immediately
+     * To check whether the message is sent, register a SendMessageEventListener using addListener()
+     *
+     * @param recipientUuid The uuid of the user
+     * @param message       The message
+     * @return The id of the message being processed
+     */
+    public String sendMessage(final String recipientUuid, final String message) {
+        final String messageId = UUID.randomUUID().toString();
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                PublicKeys recipientKeys = getPublicKeysFromServer(recipientUuid);
+                if (recipientKeys == null) {
+                    onSendMessageFailed(messageId, new Exception("Error retrieving public keys from server"));
+                    return;
+                }
+                if (recipientKeys.publicEncryptKey == null || recipientKeys.publicSignKey == null) {
+                    Log.w(TAG, "No user found for uuid " + recipientUuid);
+                    onSendMessageFailedNoUser(messageId);
+                    return;
+                }
+                try {
+                    SecretKey aesKey = generateAESKey();
+                    final String messageEncrypted = toBase64(encryptWithKey(aesKey, message.getBytes()));
+                    final String wrapedAESKey = toBase64(wrapAESKey(recipientKeys.publicEncryptKey, aesKey));
+                    final String rsaSig;
+                    try {
+                        rsaSig = getSignature(
+                                new String[]{recipientUuid, wrapedAESKey, messageEncrypted, uuid},
+                                getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)
+                        );
+                    } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                        Log.e(TAG, "Error generating signature", e);
+                        onSendMessageFailed(messageId, e);
+                        return;
+                    }
+                    StringRequest req = new StringRequest(
+                            Request.Method.POST, apiUri.resolve(ENDPOINT_SEND_MESSAGE).toString(),
+                            new Response.Listener<String>() {
+                                @Override
+                                public void onResponse(String responseStr) {
+                                    try {
+                                        JSONObject response = new JSONObject(responseStr);
+                                        if (response.getBoolean("successful")) {
+                                            onSendMessageSuccessful(messageId);
+                                        } else {
+                                            onSendMessageFailed(
+                                                    messageId,
+                                                    new RuntimeException("Server rejected the message")
+                                            );
+                                        }
+                                    } catch (JSONException e) {
+                                        Log.e(TAG, "Error parsing salt", e);
+                                        onSendMessageFailed(messageId, e);
+                                    }
+                                }
+                            }, new Response.ErrorListener() {
+                        @Override
+                        public void onErrorResponse(VolleyError error) {
+                            onSendMessageFailed(messageId, error);
+                        }
+                    }) {
+                        @Override
+                        protected Map<String, String> getParams() {
+                            Map<String, String> params = new HashMap<>();
+                            params.put("recipient_uuid", recipientUuid);
+                            params.put("aes_key_encrypted", wrapedAESKey);
+                            params.put("message", messageEncrypted);
+                            params.put("sender_uuid", uuid);
+                            params.put("rsa_sig", rsaSig);
+                            return params;
+                        }
+                    };
+                    requestQueue.add(req);
+                } catch (NoSuchAlgorithmException | NoSuchPaddingException | InvalidKeyException
+                        | BadPaddingException | IllegalBlockSizeException | InvalidAlgorithmParameterException e) {
+                    Log.e(TAG, "Error encrypting message", e);
+                    onSendMessageFailed(messageId, e);
+                    return;
+                }
+            }
+        });
+        return messageId;
     }
 
     /**
@@ -333,7 +470,6 @@ public class MimsConnect {
                 final String saltEncoded = toBase64(salt);
                 final String keyObjectEncoded = toBase64(keyObject);
                 final String retrievalHash = toBase64(getSha256(secretKey.getEncoded()));
-                RequestQueue queue = Volley.newRequestQueue(context);
                 StringRequest req = new StringRequest(
                         Request.Method.POST, apiUri.resolve(ENDPOINT_UPLOAD_KEYS).toString(),
                         new Response.Listener<String>() {
@@ -373,13 +509,6 @@ public class MimsConnect {
                         params.put("keys", keyObjectEncoded);
                         params.put("retrieval_hash", retrievalHash);
                         params.put("salt", saltEncoded);
-                        try {
-                            params.put("rsa_sig", getSignature(new String[]{
-                                    username, keyObjectEncoded, retrievalHash, saltEncoded
-                            }, getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)));
-                        } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
-                            Log.e(TAG, "Error generating signature", e);
-                        }
                         return params;
                     }
                 };
@@ -388,7 +517,7 @@ public class MimsConnect {
                         3,
                         DefaultRetryPolicy.DEFAULT_BACKOFF_MULT
                 ));
-                queue.add(req);
+                requestQueue.add(req);
             }
         });
     }
@@ -407,7 +536,6 @@ public class MimsConnect {
                     return;
                 }
                 final String retrievalHash = toBase64(getSha256(secretKey.getEncoded()));
-                RequestQueue queue = Volley.newRequestQueue(context);
                 StringRequest req = new StringRequest(
                         Request.Method.POST, apiUri.resolve(ENDPOINT_DOWNLOAD_KEYS).toString(),
                         new Response.Listener<String>() {
@@ -441,7 +569,7 @@ public class MimsConnect {
                         return params;
                     }
                 };
-                queue.add(req);
+                requestQueue.add(req);
             }
         });
     }
@@ -478,7 +606,14 @@ public class MimsConnect {
     }
 
     private void onImportDownloadedKeys(final PrivateKey encKey, final PrivateKey signKey, final String uuid) {
-        RequestQueue queue = Volley.newRequestQueue(context);
+        final String rsaSig;
+        try {
+            rsaSig = getSignature(new String[]{uuid, uuid}, signKey);
+        } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+            Log.e(TAG, "Error generating signature", e);
+            onDownloadKeyError(e);
+            return;
+        }
         StringRequest req = new StringRequest(
                 Request.Method.POST, apiUri.resolve(ENDPOINT_REQUEST_PUBLIC_KEYS).toString(),
                 new Response.Listener<String>() {
@@ -519,11 +654,7 @@ public class MimsConnect {
                 Map<String, String> params = new HashMap<>();
                 params.put("requesting_uuid", uuid);
                 params.put("requester_uuid", uuid);
-                try {
-                    params.put("rsa_sig", getSignature(new String[]{uuid, uuid}, signKey));
-                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
-                    Log.e(TAG, "Error generating signature", e);
-                }
+                params.put("rsa_sig", rsaSig);
                 return params;
             }
         };
@@ -532,7 +663,7 @@ public class MimsConnect {
                 3,
                 DefaultRetryPolicy.DEFAULT_BACKOFF_MULT
         ));
-        queue.add(req);
+        requestQueue.add(req);
     }
 
     private SecretKey deriveKey(String password, byte[] salt) throws NoSuchAlgorithmException, InvalidKeySpecException {
@@ -562,6 +693,26 @@ public class MimsConnect {
                 unwrapKeyAlgro,
                 Cipher.PRIVATE_KEY
         );
+    }
+
+    private SecretKey generateAESKey() throws NoSuchAlgorithmException {
+        KeyGenerator keyGen = KeyGenerator.getInstance("AES");
+        keyGen.init(256);
+        return keyGen.generateKey();
+    }
+
+    private byte[] wrapAESKey(PublicKey recipientEncKey, SecretKey keyBeingWraped)
+            throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException, IllegalBlockSizeException {
+        Cipher cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+        cipher.init(Cipher.WRAP_MODE, recipientEncKey);
+        return cipher.wrap(keyBeingWraped);
+    }
+
+    private SecretKey unwrapAESKeyUsingStoredPrivate(byte[] keyBeingUnwraped)
+            throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException {
+        Cipher cipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+        cipher.init(Cipher.UNWRAP_MODE, getPrivateKeyFromKeystore(KEY_ALIAS_ENC));
+        return (SecretKey) cipher.unwrap(keyBeingUnwraped, ENCRYPT_ALGRO, Cipher.SECRET_KEY);
     }
 
     private byte[] encryptWithKey(SecretKey key, byte[] bytesBeingEncrypted)
@@ -692,7 +843,79 @@ public class MimsConnect {
             Log.e(TAG, "Error retrieving keys", e);
             return null;
         }
+    }
 
+    /**
+     * Gets the public key from server
+     * This is a blocking call, it MUST BE called on another thread
+     *
+     * @param targetUuid The uuid to receive
+     * @return A pair of public encrypt/sign key
+     */
+    private PublicKeys getPublicKeysFromServer(final String targetUuid) {
+        if (Looper.getMainLooper().isCurrentThread()) {
+            Log.e(TAG, "getPublicKeysFromServer() is called on UI thread!! Aborting...");
+            return null;
+        }
+        if (this.uuid == null) {
+            Log.w(TAG, "No uuid is set for this client, please register or use existing keys");
+            return null;
+        }
+        PublicKeys cachedKeys = publicKeyCache.get(targetUuid);
+        if (cachedKeys != null) return cachedKeys;
+        RequestFuture<String> future = RequestFuture.newFuture();
+        final String rsaSig;
+        try {
+            rsaSig = getSignature(
+                    new String[]{targetUuid, uuid},
+                    getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)
+            );
+        } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+            Log.e(TAG, "Error generating signature", e);
+            return null;
+        }
+        StringRequest req = new StringRequest(
+                Request.Method.POST, apiUri.resolve(ENDPOINT_REQUEST_PUBLIC_KEYS).toString(), future, future) {
+            @Override
+            protected Map<String, String> getParams() {
+                Map<String, String> params = new HashMap<>();
+                params.put("requesting_uuid", targetUuid);
+                params.put("requester_uuid", uuid);
+                params.put("rsa_sig", rsaSig);
+                return params;
+            }
+        };
+        req.setRetryPolicy(new DefaultRetryPolicy(
+                10 * 1000,
+                3,
+                DefaultRetryPolicy.DEFAULT_BACKOFF_MULT
+        ));
+        requestQueue.add(req);
+        try {
+            String responseStr = future.get(35, TimeUnit.SECONDS);
+            JSONObject response = new JSONObject(responseStr);
+            if (!response.getBoolean("successful")) {
+                // No such uuid exist, returns empty public keys
+                return new PublicKeys(null, null);
+            }
+            JSONObject keys = response.getJSONObject("keys");
+            String encPem = keys.getString("pke");
+            String signPem = keys.getString("pks");
+            PublicKey encPublic = fromPem(encPem, RSA_ENC_ALGRO);
+            PublicKey signPublic = fromPem(signPem, RSA_SIGN_ALGRO);
+            byte[] targetRsaSig = fromBase64(keys.getString("rsa_sig"));
+            if (!verifySignature(new String[]{encPem, signPem}, signPublic, targetRsaSig)) {
+                Log.e(TAG, "Public key could not be verified. Signature mismatch! Defaulting to cache if any..");
+                return publicKeyCache.get(targetUuid);
+            }
+            publicKeyCache.putIfAbsent(targetUuid, new PublicKeys(encPublic, signPublic));
+            // The result is ignored and the cached version is used instead if it's suddenly available
+            return publicKeyCache.get(targetUuid);
+        } catch (InterruptedException | ExecutionException | TimeoutException | JSONException | NoSuchAlgorithmException
+                | InvalidKeySpecException | InvalidKeyException | SignatureException e) {
+            Log.e(TAG, "Error getting public keys. Defaulting to cache if any..", e);
+            return publicKeyCache.get(targetUuid);
+        }
     }
 
     /**
@@ -744,6 +967,16 @@ public class MimsConnect {
         return toBase64(bytes);
     }
 
+    private boolean verifySignature(String[] params, PublicKey publicSignKey, byte[] signatureBytes)
+            throws NoSuchAlgorithmException, InvalidKeyException, SignatureException {
+        Arrays.sort(params);
+        Signature signature = Signature.getInstance(RSA_SIGN_SCHEME);
+        signature.initVerify(publicSignKey);
+        String paramsStr = TextUtils.join("", params);
+        signature.update(paramsStr.getBytes(StandardCharsets.UTF_8));
+        return signature.verify(signatureBytes);
+    }
+
     private static String toBase64(byte[] bytes) {
         return Base64.encodeToString(bytes, Base64.NO_WRAP);
     }
@@ -788,12 +1021,20 @@ public class MimsConnect {
         downloadKeyEventListeners.add(listener);
     }
 
+    public void addListener(SendMessageEventListener listener) {
+        sendMessageEventListeners.add(listener);
+    }
+
     public void removeListener(RegisterEventListener listener) {
         registerEventListeners.remove(listener);
     }
 
     public void removeListener(DownloadKeyEventListener listener) {
         downloadKeyEventListeners.remove(listener);
+    }
+
+    public void removeListener(SendMessageEventListener listener) {
+        sendMessageEventListeners.remove(listener);
     }
 
     private void onRegisterSuccessful(String uuid) {
@@ -829,6 +1070,24 @@ public class MimsConnect {
     private void onDownloadKeyError(Exception e) {
         for (DownloadKeyEventListener listener : downloadKeyEventListeners) {
             listener.onError(e);
+        }
+    }
+
+    private void onSendMessageSuccessful(String messageID) {
+        for (SendMessageEventListener listener : sendMessageEventListeners) {
+            listener.onSent(messageID);
+        }
+    }
+
+    private void onSendMessageFailed(String messageID, Exception e) {
+        for (SendMessageEventListener listener : sendMessageEventListeners) {
+            listener.onFailed(messageID, e);
+        }
+    }
+
+    private void onSendMessageFailedNoUser(String messageID) {
+        for (SendMessageEventListener listener : sendMessageEventListeners) {
+            listener.onFailedNoUser(messageID);
         }
     }
 }
