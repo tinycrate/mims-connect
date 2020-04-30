@@ -11,6 +11,10 @@ import com.android.volley.*;
 import com.android.volley.toolbox.RequestFuture;
 import com.android.volley.toolbox.StringRequest;
 import com.android.volley.toolbox.Volley;
+import io.socket.client.Ack;
+import io.socket.client.IO;
+import io.socket.client.Socket;
+import io.socket.emitter.Emitter;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
@@ -19,6 +23,7 @@ import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.bouncycastle.operator.ContentSigner;
 import org.bouncycastle.operator.OperatorCreationException;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -98,6 +103,40 @@ public class MimsConnect {
         void onFailedNoUser(String messageId);
     }
 
+    /**
+     * Event handler for receiving message
+     * Register one using addListener();
+     */
+    public interface ChatServiceEventListener {
+        /**
+         * A message is received
+         *
+         * @param senderUuid The uuid of the sender
+         * @param message    The message
+         */
+        void onMessageReceive(String senderUuid, String message);
+
+        /**
+         * Called if a message is received but cannot be decrypted
+         * The message will be dropped as a result
+         *
+         * @param senderUuid The (claimed) sender of such message
+         */
+        void onMessageDecryptFailed(String senderUuid);
+
+        /** Connected to the chat service */
+        void onConnected();
+
+        /** Disconnected form the chat service */
+        void onDisconnect();
+
+        /**
+         * Disconnected form the chat service due to an error
+         * It will also be called if the connection is not successful
+         */
+        void onDisconnectWithError(Exception e);
+    }
+
     public static class PublicKeys {
         public PublicKey publicEncryptKey;
         public PublicKey publicSignKey;
@@ -122,12 +161,13 @@ public class MimsConnect {
     private final String KEYSTORE_ANDROID = "AndroidKeyStore";
 
     /* Api related constants */
-    private final String ENDPOINT_REGISTER_UUID = "/register_uuid";
-    private final String ENDPOINT_UPLOAD_KEYS = "/upload_keys";
-    private final String ENDPOINT_GET_SALT = "/get_key_salt";
-    private final String ENDPOINT_DOWNLOAD_KEYS = "/download_keys";
-    private final String ENDPOINT_REQUEST_PUBLIC_KEYS = "/request_public_keys";
-    private final String ENDPOINT_SEND_MESSAGE = "/send_message";
+    private final String ENDPOINT_REGISTER_UUID = "register_uuid";
+    private final String ENDPOINT_UPLOAD_KEYS = "upload_keys";
+    private final String ENDPOINT_GET_SALT = "get_key_salt";
+    private final String ENDPOINT_DOWNLOAD_KEYS = "download_keys";
+    private final String ENDPOINT_REQUEST_PUBLIC_KEYS = "request_public_keys";
+    private final String ENDPOINT_SEND_MESSAGE = "send_message";
+    private final String ENDPOINT_SOCKET_IO = "socket.io";
 
     /* Key names for keystore retrieval */
     private final String KEY_ALIAS_ENC = "KEY_ALIAS_ENC";
@@ -137,6 +177,7 @@ public class MimsConnect {
     private List<RegisterEventListener> registerEventListeners = new ArrayList<>();
     private List<DownloadKeyEventListener> downloadKeyEventListeners = new ArrayList<>();
     private List<SendMessageEventListener> sendMessageEventListeners = new ArrayList<>();
+    private List<ChatServiceEventListener> chatServiceEventListeners = new ArrayList<>();
 
     /* User information */
     private String uuid = null;
@@ -144,12 +185,17 @@ public class MimsConnect {
     /* Volley queue */
     private final RequestQueue requestQueue;
 
+    /* Socket io */
+    private io.socket.client.Socket socketIoClient = null;
+
     /* Cache */
     private ConcurrentHashMap<String, PublicKeys> publicKeyCache = new ConcurrentHashMap<>();
 
     /**
      * Creates an instance to connect and interface with the MIMS server
      *
+     * @param context The Android context, get via getApplicationContext()
+     * @param apiUrl  The URL to the api, must specify protocol (https://)
      * @throws NoSuchAlgorithmException User should be informed if encryption is not supported
      */
     public MimsConnect(Context context, String apiUrl) throws NoSuchAlgorithmException, URISyntaxException {
@@ -163,7 +209,7 @@ public class MimsConnect {
             throw new NoSuchAlgorithmException(
                     "This version of your operating system does not support the type of encryption used in MIMS");
         }
-        this.apiUri = new URI(apiUrl);
+        this.apiUri = new URI(apiUrl + "/");
         this.context = context;
         this.requestQueue = Volley.newRequestQueue(context);
     }
@@ -440,12 +486,126 @@ public class MimsConnect {
     }
 
     /**
+     * Connect to chat service and receive messages
+     * Returning true does not mean it has successfully connected
+     * You should register an event handler to handle chat events
+     *
+     * @return True if the request is successful
+     */
+    public boolean connectToChatService() {
+        if (uuid == null) return false;
+        if (socketIoClient != null) socketIoClient.close();
+        IO.Options options = new IO.Options();
+        URI socketIoApi = apiUri.resolve(ENDPOINT_SOCKET_IO);
+        options.path = socketIoApi.getPath();
+        URI apiRoot = socketIoApi.resolve("/");
+        socketIoClient = IO.socket(apiRoot, options);
+        socketIoClient.on(Socket.EVENT_CONNECT, new Emitter.Listener() {
+            @Override
+            public void call(Object... args) {
+                onChatServiceSubscribeMessage();
+            }
+        });
+        socketIoClient.on(Socket.EVENT_DISCONNECT, new Emitter.Listener() {
+            @Override
+            public void call(Object... args) {
+                onChatServiceDisconnect();
+            }
+        });
+        socketIoClient.on("on_message_received", new Emitter.Listener() {
+            @Override
+            public void call(Object... args) {
+                JSONArray messages = (JSONArray) args[0];
+                for (int i = 0; i < messages.length(); i++) {
+                    try {
+                        JSONObject message = messages.getJSONObject(i);
+                        String senderUuid = message.getString("sender_uuid");
+                        String messageContent = message.getString("message");
+                        String b64AesKey = message.getString("aes_key_encrypted");
+                        String rsaSig = message.getString("rsa_sig");
+                        onDecryptMessage(senderUuid, messageContent, b64AesKey, rsaSig);
+                    } catch (JSONException e) {
+                        Log.e(TAG, "Unable to parse message, skipping...");
+                    }
+                }
+                Ack ack = (Ack) args[args.length - 1];
+                ack.call();
+            }
+        });
+        socketIoClient.connect();
+        return true;
+    }
+
+    /**
      * Gets the uuid of the current user. Null if current user has no uuid registered
      *
      * @return uuid
      */
     public String getUuid() {
         return uuid;
+    }
+
+    private void onDecryptMessage(final String senderUuid, final String message, final String b64AesKey,
+                                  final String rsaSig) {
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    PublicKeys publicKeys = null;
+                    for (int i = 0; i < 5; i++) {
+                        publicKeys = getPublicKeysFromServer(senderUuid);
+                        if (publicKeys != null) break;
+                    }
+                    if (publicKeys == null || publicKeys.publicSignKey == null || publicKeys.publicEncryptKey == null) {
+                        Log.w(TAG, "Unable to retrieve public key info of sender for verification, dropping...");
+                        onMessageDecryptFailed(senderUuid);
+                        return;
+                    }
+                    if (!verifySignature(
+                            new String[]{uuid, b64AesKey, message, senderUuid},
+                            publicKeys.publicSignKey,
+                            fromBase64(rsaSig)
+                    )) {
+                        Log.w(TAG, "Message verification failed");
+                        onMessageDecryptFailed(senderUuid);
+                        return;
+                    }
+                    SecretKey aesKey = unwrapAESKeyUsingStoredPrivate(fromBase64(b64AesKey));
+                    String messageDecrypted = new String(
+                            decryptWithKey(aesKey, fromBase64(message)),
+                            StandardCharsets.UTF_8
+                    );
+                    onReceiveMessage(senderUuid, messageDecrypted);
+                } catch (NoSuchPaddingException | InvalidKeyException | NoSuchAlgorithmException
+                        | InvalidAlgorithmParameterException | BadPaddingException | IllegalBlockSizeException
+                        | SignatureException e) {
+                    Log.e(TAG, "Unable to decrypt message, dropping...");
+                    onMessageDecryptFailed(senderUuid);
+                    return;
+                }
+            }
+        });
+    }
+
+    private void onChatServiceSubscribeMessage() {
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String rsaSig = getSignature(new String[]{uuid}, getPrivateKeyFromKeystore(KEY_ALIAS_SIGN));
+                    JSONObject json = new JSONObject();
+                    json.put("uuid", uuid);
+                    json.put("rsa_sig", rsaSig);
+                    socketIoClient.emit("subscribe_messages", json);
+                    onChatServiceConnect();
+                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException | JSONException e) {
+                    Log.e(TAG, "Error subscribing message");
+                    socketIoClient.disconnect();
+                }
+            }
+        });
     }
 
     private void onRegisterUploadKeys(final String uuid, final String username, final String password,
@@ -790,7 +950,7 @@ public class MimsConnect {
                         new KeyStore.PrivateKeyEntry(keyPair.getPrivate(),
                                 new java.security.cert.Certificate[]{genSelfSignedCert(keyPair, KEY_ALIAS_ENC, uuid)}),
                         new KeyProtection.Builder(KeyProperties.PURPOSE_DECRYPT)
-                                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
+                                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_PKCS1)
                                 .build()
                 );
             } else if (keyAlias.equals(KEY_ALIAS_SIGN)) {
@@ -1025,6 +1185,10 @@ public class MimsConnect {
         sendMessageEventListeners.add(listener);
     }
 
+    public void addListener(ChatServiceEventListener listener) {
+        chatServiceEventListeners.add(listener);
+    }
+
     public void removeListener(RegisterEventListener listener) {
         registerEventListeners.remove(listener);
     }
@@ -1035,6 +1199,10 @@ public class MimsConnect {
 
     public void removeListener(SendMessageEventListener listener) {
         sendMessageEventListeners.remove(listener);
+    }
+
+    public void removeListener(ChatServiceEventListener listener) {
+        chatServiceEventListeners.remove(listener);
     }
 
     private void onRegisterSuccessful(String uuid) {
@@ -1088,6 +1256,36 @@ public class MimsConnect {
     private void onSendMessageFailedNoUser(String messageID) {
         for (SendMessageEventListener listener : sendMessageEventListeners) {
             listener.onFailedNoUser(messageID);
+        }
+    }
+
+    private void onReceiveMessage(String senderUuid, String message) {
+        for (ChatServiceEventListener listener : chatServiceEventListeners) {
+            listener.onMessageReceive(senderUuid, message);
+        }
+    }
+
+    private void onMessageDecryptFailed(String senderUuid) {
+        for (ChatServiceEventListener listener : chatServiceEventListeners) {
+            listener.onMessageDecryptFailed(senderUuid);
+        }
+    }
+
+    private void onChatServiceConnect() {
+        for (ChatServiceEventListener listener : chatServiceEventListeners) {
+            listener.onConnected();
+        }
+    }
+
+    private void onChatServiceDisconnect() {
+        for (ChatServiceEventListener listener : chatServiceEventListeners) {
+            listener.onDisconnect();
+        }
+    }
+
+    private void onChatServiceError(Exception e) {
+        for (ChatServiceEventListener listener : chatServiceEventListeners) {
+            listener.onDisconnectWithError(e);
         }
     }
 }
