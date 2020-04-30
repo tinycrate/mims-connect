@@ -313,149 +313,168 @@ public class MimsConnect {
 
     private void onRegisterUploadKeys(final String uuid, final String username, final String password,
                                       final KeyPair keyEnc, final KeyPair keySign) {
-        byte[] salt = generateBytes(32);
-        SecretKey secretKey = null;
-        byte[] keyObject;
-        try {
-            secretKey = deriveKey(password, salt);
-            keyObject = buildPrivateKeyObject(secretKey, keyEnc.getPrivate(), keySign.getPrivate(), uuid);
-        } catch (InvalidKeySpecException | IllegalBlockSizeException | InvalidKeyException | NoSuchPaddingException
-                | JSONException | NoSuchAlgorithmException | InvalidAlgorithmParameterException
-                | BadPaddingException e) {
-            Log.e(TAG, "Error encrypting keys", e);
-            onRegisterFailed(e);
-            return;
-        }
-        final String saltEncoded = toBase64(salt);
-        final String keyObjectEncoded = toBase64(keyObject);
-        final String retrievalHash = toBase64(getSha256(secretKey.getEncoded()));
-        RequestQueue queue = Volley.newRequestQueue(context);
-        StringRequest req = new StringRequest(
-                Request.Method.POST, apiUri.resolve(ENDPOINT_UPLOAD_KEYS).toString(),
-                new Response.Listener<String>() {
-                    @Override
-                    public void onResponse(String responseStr) {
-                        try {
-                            JSONObject response = new JSONObject(responseStr);
-                            if (response.getBoolean("successful")) {
-                                boolean keyEncSuccessful = storeKeyInKeystore(keyEnc, KEY_ALIAS_ENC, uuid);
-                                boolean keySignSuccessful = storeKeyInKeystore(keySign, KEY_ALIAS_SIGN, uuid);
-                                if (keyEncSuccessful && keySignSuccessful) {
-                                    MimsConnect.this.uuid = uuid;
-                                    onRegisterSuccessful(uuid);
-                                } else {
-                                    onRegisterFailed(new RuntimeException("Unable to import keys"));
-                                }
-                            } else if (response.getString("message").equals("duplicated")) {
-                                onRegisterUsernameDuplicated();
-                            } else {
-                                onRegisterFailed(new RuntimeException("Unable to register key on server"));
-                            }
-                        } catch (JSONException e) {
-                            Log.e(TAG, "Error parsing upload key response", e);
-                            onRegisterFailed(e);
-                        }
-                    }
-                }, new Response.ErrorListener() {
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        threadPool.submit(new Runnable() {
             @Override
-            public void onErrorResponse(VolleyError error) {
-                onRegisterFailed(error);
-            }
-        }) {
-            @Override
-            protected Map<String, String> getParams() throws AuthFailureError {
-                Map<String, String> params = new HashMap<>();
-                params.put("username", username);
-                params.put("keys", keyObjectEncoded);
-                params.put("retrieval_hash", retrievalHash);
-                params.put("salt", saltEncoded);
+            public void run() {
+                byte[] salt = generateBytes(32);
+                SecretKey secretKey = null;
+                byte[] keyObject;
                 try {
-                    params.put("rsa_sig", getSignature(new String[]{
-                            username, keyObjectEncoded, retrievalHash, saltEncoded
-                    }, getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)));
-                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
-                    Log.e(TAG, "Error generating signature", e);
+                    secretKey = deriveKey(password, salt);
+                    keyObject = buildPrivateKeyObject(secretKey, keyEnc.getPrivate(), keySign.getPrivate(), uuid);
+                } catch (InvalidKeySpecException | IllegalBlockSizeException | InvalidKeyException
+                        | NoSuchPaddingException | JSONException | NoSuchAlgorithmException
+                        | InvalidAlgorithmParameterException | BadPaddingException e) {
+                    Log.e(TAG, "Error encrypting keys", e);
+                    onRegisterFailed(e);
+                    return;
                 }
-                return params;
-            }
-        };
-        req.setRetryPolicy(new DefaultRetryPolicy(
-                10 * 1000,
-                3,
-                DefaultRetryPolicy.DEFAULT_BACKOFF_MULT
-        ));
-        queue.add(req);
-    }
-
-    private void onDownloadExistingKeys(final String username, String password, byte[] salt) {
-        final SecretKey secretKey;
-        try {
-            secretKey = deriveKey(password, salt);
-        } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
-            Log.e(TAG, "Error deriving key", e);
-            onDownloadKeyError(e);
-            return;
-        }
-        final String retrievalHash = toBase64(getSha256(secretKey.getEncoded()));
-        RequestQueue queue = Volley.newRequestQueue(context);
-        StringRequest req = new StringRequest(
-                Request.Method.POST, apiUri.resolve(ENDPOINT_DOWNLOAD_KEYS).toString(),
-                new Response.Listener<String>() {
-                    @Override
-                    public void onResponse(String responseStr) {
-                        try {
-                            JSONObject response = new JSONObject(responseStr);
-                            if (response.getBoolean("successful")) {
-                                onParseDownloadedKeys(secretKey, response.getString("keys"));
-                            } else if (response.getString("message").equals("noentries")) {
-                                onDownloadKeyFailed();
-                            } else {
-                                onDownloadKeyError(new RuntimeException("Unable to retrieve keys from server"));
+                final String saltEncoded = toBase64(salt);
+                final String keyObjectEncoded = toBase64(keyObject);
+                final String retrievalHash = toBase64(getSha256(secretKey.getEncoded()));
+                RequestQueue queue = Volley.newRequestQueue(context);
+                StringRequest req = new StringRequest(
+                        Request.Method.POST, apiUri.resolve(ENDPOINT_UPLOAD_KEYS).toString(),
+                        new Response.Listener<String>() {
+                            @Override
+                            public void onResponse(String responseStr) {
+                                try {
+                                    JSONObject response = new JSONObject(responseStr);
+                                    if (response.getBoolean("successful")) {
+                                        boolean keyEncSuccessful = storeKeyInKeystore(keyEnc, KEY_ALIAS_ENC, uuid);
+                                        boolean keySignSuccessful = storeKeyInKeystore(keySign, KEY_ALIAS_SIGN, uuid);
+                                        if (keyEncSuccessful && keySignSuccessful) {
+                                            MimsConnect.this.uuid = uuid;
+                                            onRegisterSuccessful(uuid);
+                                        } else {
+                                            onRegisterFailed(new RuntimeException("Unable to import keys"));
+                                        }
+                                    } else if (response.getString("message").equals("duplicated")) {
+                                        onRegisterUsernameDuplicated();
+                                    } else {
+                                        onRegisterFailed(new RuntimeException("Unable to register key on server"));
+                                    }
+                                } catch (JSONException e) {
+                                    Log.e(TAG, "Error parsing upload key response", e);
+                                    onRegisterFailed(e);
+                                }
                             }
-                        } catch (JSONException e) {
-                            Log.e(TAG, "Error parsing response", e);
-                            onDownloadKeyError(e);
-                        }
+                        }, new Response.ErrorListener() {
+                    @Override
+                    public void onErrorResponse(VolleyError error) {
+                        onRegisterFailed(error);
                     }
-                }, new Response.ErrorListener() {
-            @Override
-            public void onErrorResponse(VolleyError error) {
-                onDownloadKeyError(error);
+                }) {
+                    @Override
+                    protected Map<String, String> getParams() throws AuthFailureError {
+                        Map<String, String> params = new HashMap<>();
+                        params.put("username", username);
+                        params.put("keys", keyObjectEncoded);
+                        params.put("retrieval_hash", retrievalHash);
+                        params.put("salt", saltEncoded);
+                        try {
+                            params.put("rsa_sig", getSignature(new String[]{
+                                    username, keyObjectEncoded, retrievalHash, saltEncoded
+                            }, getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)));
+                        } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                            Log.e(TAG, "Error generating signature", e);
+                        }
+                        return params;
+                    }
+                };
+                req.setRetryPolicy(new DefaultRetryPolicy(
+                        10 * 1000,
+                        3,
+                        DefaultRetryPolicy.DEFAULT_BACKOFF_MULT
+                ));
+                queue.add(req);
             }
-        }) {
-            @Override
-            protected Map<String, String> getParams() {
-                Map<String, String> params = new HashMap<>();
-                params.put("username", username);
-                params.put("retrieval_hash", retrievalHash);
-                return params;
-            }
-        };
-        queue.add(req);
+        });
     }
 
-    private void onParseDownloadedKeys(SecretKey secretKey, String b64Keys) {
-        JSONObject privateKeyObject = null;
-        try {
-            privateKeyObject = decryptPrivateKeyObject(secretKey, fromBase64(b64Keys));
-            PrivateKey enc = unwrapPrivateKey(
-                    secretKey,
-                    fromBase64(privateKeyObject.getString("ske")),
-                    RSA_ENC_ALGRO
-            );
-            PrivateKey sign = unwrapPrivateKey(
-                    secretKey,
-                    fromBase64(privateKeyObject.getString("sks")),
-                    RSA_SIGN_ALGRO
-            );
-            String uuid = privateKeyObject.getString("uuid");
-            onImportDownloadedKeys(enc, sign, uuid);
-        } catch (JSONException | NoSuchPaddingException | InvalidAlgorithmParameterException | NoSuchAlgorithmException
-                | IllegalBlockSizeException | BadPaddingException | InvalidKeyException e) {
-            Log.e(TAG, "Error parsing retrieved keys", e);
-            onDownloadKeyError(e);
-            return;
-        }
+    private void onDownloadExistingKeys(final String username, final String password, final byte[] salt) {
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                final SecretKey secretKey;
+                try {
+                    secretKey = deriveKey(password, salt);
+                } catch (NoSuchAlgorithmException | InvalidKeySpecException e) {
+                    Log.e(TAG, "Error deriving key", e);
+                    onDownloadKeyError(e);
+                    return;
+                }
+                final String retrievalHash = toBase64(getSha256(secretKey.getEncoded()));
+                RequestQueue queue = Volley.newRequestQueue(context);
+                StringRequest req = new StringRequest(
+                        Request.Method.POST, apiUri.resolve(ENDPOINT_DOWNLOAD_KEYS).toString(),
+                        new Response.Listener<String>() {
+                            @Override
+                            public void onResponse(String responseStr) {
+                                try {
+                                    JSONObject response = new JSONObject(responseStr);
+                                    if (response.getBoolean("successful")) {
+                                        onParseDownloadedKeys(secretKey, response.getString("keys"));
+                                    } else if (response.getString("message").equals("noentries")) {
+                                        onDownloadKeyFailed();
+                                    } else {
+                                        onDownloadKeyError(new RuntimeException("Unable to retrieve keys from server"));
+                                    }
+                                } catch (JSONException e) {
+                                    Log.e(TAG, "Error parsing response", e);
+                                    onDownloadKeyError(e);
+                                }
+                            }
+                        }, new Response.ErrorListener() {
+                    @Override
+                    public void onErrorResponse(VolleyError error) {
+                        onDownloadKeyError(error);
+                    }
+                }) {
+                    @Override
+                    protected Map<String, String> getParams() {
+                        Map<String, String> params = new HashMap<>();
+                        params.put("username", username);
+                        params.put("retrieval_hash", retrievalHash);
+                        return params;
+                    }
+                };
+                queue.add(req);
+            }
+        });
+    }
+
+    private void onParseDownloadedKeys(final SecretKey secretKey, final String b64Keys) {
+        ExecutorService threadPool = Executors.newCachedThreadPool();
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                JSONObject privateKeyObject = null;
+                try {
+                    privateKeyObject = decryptPrivateKeyObject(secretKey, fromBase64(b64Keys));
+                    PrivateKey enc = unwrapPrivateKey(
+                            secretKey,
+                            fromBase64(privateKeyObject.getString("ske")),
+                            RSA_ENC_ALGRO
+                    );
+                    PrivateKey sign = unwrapPrivateKey(
+                            secretKey,
+                            fromBase64(privateKeyObject.getString("sks")),
+                            RSA_SIGN_ALGRO
+                    );
+                    String uuid = privateKeyObject.getString("uuid");
+                    onImportDownloadedKeys(enc, sign, uuid);
+                } catch (JSONException | NoSuchPaddingException | InvalidAlgorithmParameterException
+                        | NoSuchAlgorithmException | IllegalBlockSizeException | BadPaddingException
+                        | InvalidKeyException e) {
+                    Log.e(TAG, "Error parsing retrieved keys", e);
+                    onDownloadKeyError(e);
+                    return;
+                }
+            }
+        });
     }
 
     private void onImportDownloadedKeys(final PrivateKey encKey, final PrivateKey signKey, final String uuid) {
