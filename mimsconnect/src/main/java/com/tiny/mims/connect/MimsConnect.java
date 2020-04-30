@@ -218,8 +218,8 @@ public class MimsConnect {
             keyStore.load(null);
             X509Certificate ce = (X509Certificate) keyStore.getCertificate(KEY_ALIAS_ENC);
             X509Certificate cs = (X509Certificate) keyStore.getCertificate(KEY_ALIAS_SIGN);
-            String ceUuid = ce.getSubjectDN().getName().replace("CN=", "");
-            String csUuid = cs.getSubjectDN().getName().replace("CN=", "");
+            String ceUuid = ce.getSubjectDN().getName().substring(3);
+            String csUuid = cs.getSubjectDN().getName().substring(3);
             if (ceUuid.equals(csUuid)) {
                 uuid = ceUuid;
                 return true;
@@ -252,6 +252,7 @@ public class MimsConnect {
         } catch (CertificateException | NoSuchAlgorithmException | IOException | KeyStoreException e) {
             Log.i(TAG, "Signing key cannot be deleted. Probably does not exist.");
         }
+        this.uuid = null;
     }
 
     public void downloadExistingKey(final String username, final String password) {
@@ -337,10 +338,14 @@ public class MimsConnect {
                         try {
                             JSONObject response = new JSONObject(responseStr);
                             if (response.getBoolean("successful")) {
-                                storeKeyInKeystore(keyEnc, KEY_ALIAS_ENC, uuid);
-                                storeKeyInKeystore(keySign, KEY_ALIAS_SIGN, uuid);
-                                MimsConnect.this.uuid = uuid;
-                                onRegisterSuccessful(uuid);
+                                boolean keyEncSuccessful = storeKeyInKeystore(keyEnc, KEY_ALIAS_ENC, uuid);
+                                boolean keySignSuccessful = storeKeyInKeystore(keySign, KEY_ALIAS_SIGN, uuid);
+                                if (keyEncSuccessful && keySignSuccessful) {
+                                    MimsConnect.this.uuid = uuid;
+                                    onRegisterSuccessful(uuid);
+                                } else {
+                                    onRegisterFailed(new RuntimeException("Unable to import keys"));
+                                }
                             } else if (response.getString("message").equals("duplicated")) {
                                 onRegisterUsernameDuplicated();
                             } else {
@@ -375,7 +380,7 @@ public class MimsConnect {
             }
         };
         req.setRetryPolicy(new DefaultRetryPolicy(
-                15 * 1000,
+                10 * 1000,
                 3,
                 DefaultRetryPolicy.DEFAULT_BACKOFF_MULT
         ));
@@ -463,15 +468,19 @@ public class MimsConnect {
                         try {
                             JSONObject response = new JSONObject(responseStr);
                             if (response.getBoolean("successful")) {
-                                JSONObject keys =  response.getJSONObject("keys");
+                                JSONObject keys = response.getJSONObject("keys");
                                 PublicKey encPublic = fromPem(keys.getString("pke"), RSA_ENC_ALGRO);
                                 PublicKey signPublic = fromPem(keys.getString("pks"), RSA_SIGN_ALGRO);
                                 KeyPair encPair = new KeyPair(encPublic, encKey);
                                 KeyPair signPair = new KeyPair(signPublic, signKey);
-                                storeKeyInKeystore(encPair, KEY_ALIAS_ENC, uuid);
-                                storeKeyInKeystore(signPair, KEY_ALIAS_SIGN, uuid);
-                                MimsConnect.this.uuid = uuid;
-                                onDownloadKeySuccessful(uuid);
+                                boolean encSuccessful = storeKeyInKeystore(encPair, KEY_ALIAS_ENC, uuid);
+                                boolean signSuccessful = storeKeyInKeystore(signPair, KEY_ALIAS_SIGN, uuid);
+                                if (encSuccessful && signSuccessful) {
+                                    MimsConnect.this.uuid = uuid;
+                                    onDownloadKeySuccessful(uuid);
+                                } else {
+                                    onDownloadKeyError(new RuntimeException("Unable to import keys"));
+                                }
                             } else {
                                 onDownloadKeyError(new RuntimeException("Unable to retrieve public keys from server"));
                             }
@@ -499,6 +508,11 @@ public class MimsConnect {
                 return params;
             }
         };
+        req.setRetryPolicy(new DefaultRetryPolicy(
+                10 * 1000,
+                3,
+                DefaultRetryPolicy.DEFAULT_BACKOFF_MULT
+        ));
         queue.add(req);
     }
 
