@@ -560,7 +560,7 @@ public class MimsConnect {
             InvalidAlgorithmParameterException, BadPaddingException, IllegalBlockSizeException {
         GCMParameterSpec spec = new GCMParameterSpec(128, bytesBeingDecrypted, 0, 12);
         Cipher cipher = Cipher.getInstance(ENCRYPT_ALGRO);
-        cipher.init(Cipher.UNWRAP_MODE, key, spec);
+        cipher.init(Cipher.DECRYPT_MODE, key, spec);
         return cipher.doFinal(bytesBeingDecrypted, 12, bytesBeingDecrypted.length - 12);
     }
 
