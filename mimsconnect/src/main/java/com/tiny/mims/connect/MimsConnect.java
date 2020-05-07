@@ -144,11 +144,36 @@ public class MimsConnect {
         String TYPE_DISPLAY_NAME = "display_name";
         String TYPE_DISPLAY_STATUS = "display_status";
 
-        /** Called when update is successful */
+        /**
+         * Called when update is successful
+         *
+         * @param updateType The type of info being updated
+         */
         void onSuccess(String updateType);
 
-        /** Called when update is failed */
+        /**
+         * Called when update is failed
+         *
+         * @param updateType The type of info being updated
+         */
         void onFailure(String updateType, Exception e);
+    }
+
+
+    /**
+     * Event handler for retrieving user info
+     */
+    public interface UserInfoRetrieveListener {
+        /**
+         * Called when retrieval is successful
+         *
+         * @param targetUuid The uuid of the user
+         * @param info       The public info of the user
+         */
+        void onSuccess(String targetUuid, UserInfo info);
+
+        /** Called when retrieval is failed */
+        void onFailure(String targetUuid, Exception e);
     }
 
     public static class PublicKeys {
@@ -158,6 +183,39 @@ public class MimsConnect {
         public PublicKeys(PublicKey publicEncryptKey, PublicKey publicSignKey) {
             this.publicEncryptKey = publicEncryptKey;
             this.publicSignKey = publicSignKey;
+        }
+    }
+
+    public static class UserInfo {
+        private final String displayName;
+        private final String displayStatus;
+        private final String displayIconB64;
+
+        public UserInfo(String displayName, String displayStatus, String displayIconB64) {
+            this.displayName = displayName;
+            this.displayStatus = displayStatus;
+            this.displayIconB64 = displayIconB64;
+        }
+
+        /**
+         * @return Display name
+         */
+        public String getDisplayName() {
+            return displayName;
+        }
+
+        /**
+         * @return Display status
+         */
+        public String getDisplayStatus() {
+            return displayStatus;
+        }
+
+        /**
+         * @return Display icon in base64
+         */
+        public String getDisplayIconB64() {
+            return displayIconB64;
         }
     }
 
@@ -185,6 +243,7 @@ public class MimsConnect {
     private final String ENDPOINT_UPDATE_DISPLAY_NAME = "set_display_name";
     private final String ENDPOINT_UPDATE_DISPLAY_STATUS = "set_display_status";
     private final String ENDPOINT_UPDATE_DISPLAY_ICON = "set_display_icon";
+    private final String ENDPOINT_REQUEST_USER_INFO = "request_public_info";
 
 
     /* Key names for keystore retrieval */
@@ -197,6 +256,7 @@ public class MimsConnect {
     private List<SendMessageEventListener> sendMessageEventListeners = new ArrayList<>();
     private List<ChatServiceEventListener> chatServiceEventListeners = new ArrayList<>();
     private List<UserInfoUpdateListener> userInfoUpdateEventListeners = new ArrayList<>();
+    private List<UserInfoRetrieveListener> userInfoRetrieveEventListeners = new ArrayList<>();
 
     /* User information */
     private String uuid = null;
@@ -502,13 +562,18 @@ public class MimsConnect {
         return messageId;
     }
 
+    /**
+     * Updates the user display name
+     *
+     * @param displayName The name to replace
+     */
     public void updateUserDisplayName(final String displayName) {
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
                 final String rsaSig;
                 try {
-                     rsaSig = getSignature(
+                    rsaSig = getSignature(
                             new String[]{uuid, displayName},
                             getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)
                     );
@@ -556,6 +621,11 @@ public class MimsConnect {
         });
     }
 
+    /**
+     * Updates the user display status
+     *
+     * @param displayStatus The display status to replace
+     */
     public void updateUserDisplayStatus(final String displayStatus) {
         threadPool.submit(new Runnable() {
             @Override
@@ -582,7 +652,7 @@ public class MimsConnect {
                                     } else {
                                         onUserInfoUpdateFailed(
                                                 UserInfoUpdateListener.TYPE_DISPLAY_STATUS,
-                                                new RuntimeException("Server rejected the message")
+                                                new RuntimeException("Server rejected the request")
                                         );
                                     }
                                 } catch (JSONException e) {
@@ -601,6 +671,65 @@ public class MimsConnect {
                         Map<String, String> params = new HashMap<>();
                         params.put("uuid", uuid);
                         params.put("display_status", displayStatus);
+                        params.put("rsa_sig", rsaSig);
+                        return params;
+                    }
+                };
+                requestQueue.add(req);
+            }
+        });
+    }
+
+    public void retrieveUserPublicInfo(final String targetUuid) {
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                final String rsaSig;
+                try {
+                    rsaSig = getSignature(
+                            new String[]{targetUuid, uuid},
+                            getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)
+                    );
+                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                    onUserInfoRetrieveFailed(targetUuid, e);
+                    return;
+                }
+                StringRequest req = new StringRequest(
+                        Request.Method.POST, apiUri.resolve(ENDPOINT_REQUEST_USER_INFO).toString(),
+                        new Response.Listener<String>() {
+                            @Override
+                            public void onResponse(String responseStr) {
+                                try {
+                                    JSONObject response = new JSONObject(responseStr);
+                                    if (response.getBoolean("successful")) {
+                                        JSONObject info = response.getJSONObject("user_status");
+                                        onUserInfoRetrieved(targetUuid, new UserInfo(
+                                                info.getString("display_name"),
+                                                info.getString("display_status"),
+                                                info.getString("display_icon")
+                                        ));
+                                    } else {
+                                        onUserInfoRetrieveFailed(
+                                                targetUuid,
+                                                new RuntimeException("Server rejected the request")
+                                        );
+                                    }
+                                } catch (JSONException e) {
+                                    Log.e(TAG, "Error parsing response", e);
+                                    onUserInfoRetrieveFailed(targetUuid, e);
+                                }
+                            }
+                        }, new Response.ErrorListener() {
+                    @Override
+                    public void onErrorResponse(VolleyError error) {
+                        onUserInfoRetrieveFailed(targetUuid, error);
+                    }
+                }) {
+                    @Override
+                    protected Map<String, String> getParams() {
+                        Map<String, String> params = new HashMap<>();
+                        params.put("requesting_uuid", targetUuid);
+                        params.put("requester_uuid", uuid);
                         params.put("rsa_sig", rsaSig);
                         return params;
                     }
@@ -1313,6 +1442,10 @@ public class MimsConnect {
         userInfoUpdateEventListeners.add(listener);
     }
 
+    public void addListener(UserInfoRetrieveListener listener) {
+        userInfoRetrieveEventListeners.add(listener);
+    }
+
     public void removeListener(RegisterEventListener listener) {
         registerEventListeners.remove(listener);
     }
@@ -1331,6 +1464,10 @@ public class MimsConnect {
 
     public void removeListener(UserInfoUpdateListener listener) {
         userInfoUpdateEventListeners.remove(listener);
+    }
+
+    public void removeListener(UserInfoRetrieveListener listener) {
+        userInfoRetrieveEventListeners.remove(listener);
     }
 
     private void onRegisterSuccessful(String uuid) {
@@ -1426,6 +1563,18 @@ public class MimsConnect {
     private void onUserInfoUpdateFailed(String updateType, Exception e) {
         for (UserInfoUpdateListener listener : userInfoUpdateEventListeners) {
             listener.onFailure(updateType, e);
+        }
+    }
+
+    private void onUserInfoRetrieved(String targetUuid, UserInfo info) {
+        for (UserInfoRetrieveListener listener : userInfoRetrieveEventListeners) {
+            listener.onSuccess(targetUuid, info);
+        }
+    }
+
+    private void onUserInfoRetrieveFailed(String targetUuid, Exception e) {
+        for (UserInfoRetrieveListener listener : userInfoRetrieveEventListeners) {
+            listener.onFailure(targetUuid, e);
         }
     }
 }
