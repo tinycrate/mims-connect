@@ -137,6 +137,20 @@ public class MimsConnect {
         void onDisconnectWithError(Exception e);
     }
 
+    /**
+     * Event handler for updating user info
+     */
+    public interface UserInfoUpdateListener {
+        String TYPE_DISPLAY_NAME = "display_name";
+        String TYPE_DISPLAY_STATUS = "display_status";
+
+        /** Called when update is successful */
+        void onSuccess(String updateType);
+
+        /** Called when update is failed */
+        void onFailure(String updateType, Exception e);
+    }
+
     public static class PublicKeys {
         public PublicKey publicEncryptKey;
         public PublicKey publicSignKey;
@@ -168,6 +182,10 @@ public class MimsConnect {
     private final String ENDPOINT_REQUEST_PUBLIC_KEYS = "request_public_keys";
     private final String ENDPOINT_SEND_MESSAGE = "send_message";
     private final String ENDPOINT_SOCKET_IO = "socket.io";
+    private final String ENDPOINT_UPDATE_DISPLAY_NAME = "set_display_name";
+    private final String ENDPOINT_UPDATE_DISPLAY_STATUS = "set_display_status";
+    private final String ENDPOINT_UPDATE_DISPLAY_ICON = "set_display_icon";
+
 
     /* Key names for keystore retrieval */
     private final String KEY_ALIAS_ENC = "KEY_ALIAS_ENC";
@@ -178,12 +196,14 @@ public class MimsConnect {
     private List<DownloadKeyEventListener> downloadKeyEventListeners = new ArrayList<>();
     private List<SendMessageEventListener> sendMessageEventListeners = new ArrayList<>();
     private List<ChatServiceEventListener> chatServiceEventListeners = new ArrayList<>();
+    private List<UserInfoUpdateListener> userInfoUpdateEventListeners = new ArrayList<>();
 
     /* User information */
     private String uuid = null;
 
-    /* Volley queue */
+    /* Volley queue and threadpool */
     private final RequestQueue requestQueue;
+    private final ExecutorService threadPool = Executors.newCachedThreadPool();
 
     /* Socket io */
     private io.socket.client.Socket socketIoClient = null;
@@ -234,7 +254,6 @@ public class MimsConnect {
      * @throws NoSuchAlgorithmException Encryption scheme not supported by this client
      */
     public void registerNewKeys(final String username, final String password) {
-        ExecutorService threadPool = Executors.newCachedThreadPool();
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
@@ -352,7 +371,6 @@ public class MimsConnect {
     }
 
     public void downloadExistingKey(final String username, final String password) {
-        ExecutorService threadPool = Executors.newCachedThreadPool();
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
@@ -407,7 +425,6 @@ public class MimsConnect {
      */
     public String sendMessage(final String recipientUuid, final String message) {
         final String messageId = UUID.randomUUID().toString();
-        ExecutorService threadPool = Executors.newCachedThreadPool();
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
@@ -485,6 +502,114 @@ public class MimsConnect {
         return messageId;
     }
 
+    public void updateUserDisplayName(final String displayName) {
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                final String rsaSig;
+                try {
+                     rsaSig = getSignature(
+                            new String[]{uuid, displayName},
+                            getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)
+                    );
+                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                    onUserInfoUpdateFailed(UserInfoUpdateListener.TYPE_DISPLAY_NAME, e);
+                    return;
+                }
+                StringRequest req = new StringRequest(
+                        Request.Method.POST, apiUri.resolve(ENDPOINT_UPDATE_DISPLAY_NAME).toString(),
+                        new Response.Listener<String>() {
+                            @Override
+                            public void onResponse(String responseStr) {
+                                try {
+                                    JSONObject response = new JSONObject(responseStr);
+                                    if (response.getBoolean("successful")) {
+                                        onUserInfoUpdateSuccess(UserInfoUpdateListener.TYPE_DISPLAY_NAME);
+                                    } else {
+                                        onUserInfoUpdateFailed(
+                                                UserInfoUpdateListener.TYPE_DISPLAY_NAME,
+                                                new RuntimeException("Server rejected the message")
+                                        );
+                                    }
+                                } catch (JSONException e) {
+                                    Log.e(TAG, "Error parsing response", e);
+                                    onUserInfoUpdateFailed(UserInfoUpdateListener.TYPE_DISPLAY_NAME, e);
+                                }
+                            }
+                        }, new Response.ErrorListener() {
+                    @Override
+                    public void onErrorResponse(VolleyError error) {
+                        onUserInfoUpdateFailed(UserInfoUpdateListener.TYPE_DISPLAY_NAME, error);
+                    }
+                }) {
+                    @Override
+                    protected Map<String, String> getParams() {
+                        Map<String, String> params = new HashMap<>();
+                        params.put("uuid", uuid);
+                        params.put("display_name", displayName);
+                        params.put("rsa_sig", rsaSig);
+                        return params;
+                    }
+                };
+                requestQueue.add(req);
+            }
+        });
+    }
+
+    public void updateUserDisplayStatus(final String displayStatus) {
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                final String rsaSig;
+                try {
+                    rsaSig = getSignature(
+                            new String[]{uuid, displayStatus},
+                            getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)
+                    );
+                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                    onUserInfoUpdateFailed(UserInfoUpdateListener.TYPE_DISPLAY_STATUS, e);
+                    return;
+                }
+                StringRequest req = new StringRequest(
+                        Request.Method.POST, apiUri.resolve(ENDPOINT_UPDATE_DISPLAY_STATUS).toString(),
+                        new Response.Listener<String>() {
+                            @Override
+                            public void onResponse(String responseStr) {
+                                try {
+                                    JSONObject response = new JSONObject(responseStr);
+                                    if (response.getBoolean("successful")) {
+                                        onUserInfoUpdateSuccess(UserInfoUpdateListener.TYPE_DISPLAY_STATUS);
+                                    } else {
+                                        onUserInfoUpdateFailed(
+                                                UserInfoUpdateListener.TYPE_DISPLAY_STATUS,
+                                                new RuntimeException("Server rejected the message")
+                                        );
+                                    }
+                                } catch (JSONException e) {
+                                    Log.e(TAG, "Error parsing response", e);
+                                    onUserInfoUpdateFailed(UserInfoUpdateListener.TYPE_DISPLAY_STATUS, e);
+                                }
+                            }
+                        }, new Response.ErrorListener() {
+                    @Override
+                    public void onErrorResponse(VolleyError error) {
+                        onUserInfoUpdateFailed(UserInfoUpdateListener.TYPE_DISPLAY_STATUS, error);
+                    }
+                }) {
+                    @Override
+                    protected Map<String, String> getParams() {
+                        Map<String, String> params = new HashMap<>();
+                        params.put("uuid", uuid);
+                        params.put("display_status", displayStatus);
+                        params.put("rsa_sig", rsaSig);
+                        return params;
+                    }
+                };
+                requestQueue.add(req);
+            }
+        });
+    }
+
     /**
      * Connect to chat service and receive messages
      * Returning true does not mean it has successfully connected
@@ -547,7 +672,6 @@ public class MimsConnect {
 
     private void onDecryptMessage(final String senderUuid, final String message, final String b64AesKey,
                                   final String rsaSig) {
-        ExecutorService threadPool = Executors.newCachedThreadPool();
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
@@ -589,7 +713,6 @@ public class MimsConnect {
     }
 
     private void onChatServiceSubscribeMessage() {
-        ExecutorService threadPool = Executors.newCachedThreadPool();
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
@@ -610,7 +733,6 @@ public class MimsConnect {
 
     private void onRegisterUploadKeys(final String uuid, final String username, final String password,
                                       final KeyPair keyEnc, final KeyPair keySign) {
-        ExecutorService threadPool = Executors.newCachedThreadPool();
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
@@ -683,7 +805,6 @@ public class MimsConnect {
     }
 
     private void onDownloadExistingKeys(final String username, final String password, final byte[] salt) {
-        ExecutorService threadPool = Executors.newCachedThreadPool();
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
@@ -735,7 +856,6 @@ public class MimsConnect {
     }
 
     private void onParseDownloadedKeys(final SecretKey secretKey, final String b64Keys) {
-        ExecutorService threadPool = Executors.newCachedThreadPool();
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
@@ -1189,6 +1309,10 @@ public class MimsConnect {
         chatServiceEventListeners.add(listener);
     }
 
+    public void addListener(UserInfoUpdateListener listener) {
+        userInfoUpdateEventListeners.add(listener);
+    }
+
     public void removeListener(RegisterEventListener listener) {
         registerEventListeners.remove(listener);
     }
@@ -1203,6 +1327,10 @@ public class MimsConnect {
 
     public void removeListener(ChatServiceEventListener listener) {
         chatServiceEventListeners.remove(listener);
+    }
+
+    public void removeListener(UserInfoUpdateListener listener) {
+        userInfoUpdateEventListeners.remove(listener);
     }
 
     private void onRegisterSuccessful(String uuid) {
@@ -1286,6 +1414,18 @@ public class MimsConnect {
     private void onChatServiceError(Exception e) {
         for (ChatServiceEventListener listener : chatServiceEventListeners) {
             listener.onDisconnectWithError(e);
+        }
+    }
+
+    private void onUserInfoUpdateSuccess(String updateType) {
+        for (UserInfoUpdateListener listener : userInfoUpdateEventListeners) {
+            listener.onSuccess(updateType);
+        }
+    }
+
+    private void onUserInfoUpdateFailed(String updateType, Exception e) {
+        for (UserInfoUpdateListener listener : userInfoUpdateEventListeners) {
+            listener.onFailure(updateType, e);
         }
     }
 }
