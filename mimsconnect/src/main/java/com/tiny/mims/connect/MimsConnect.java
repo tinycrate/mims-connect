@@ -113,8 +113,9 @@ public class MimsConnect {
          *
          * @param senderUuid The uuid of the sender
          * @param message    The message
+         * @param timeSent   Time message being sent
          */
-        void onMessageReceive(String senderUuid, String message);
+        void onMessageReceive(String senderUuid, String message, Date timeSent);
 
         /**
          * Called if a message is received but cannot be decrypted
@@ -174,6 +175,28 @@ public class MimsConnect {
 
         /** Called when retrieval is failed */
         void onFailure(String targetUuid, Exception e);
+    }
+
+    /**
+     * Event handler for retrieving user info
+     */
+    public interface UsernameCheckListener {
+        /**
+         * Called when username is available
+         *
+         * @param username The requested username
+         */
+        void onAvailable(String username);
+
+        /**
+         * Called when username is used
+         *
+         * @param username The requested username
+         */
+        void onUsed(String username);
+
+        /** Called when retrieval is failed */
+        void onError(String username, Exception e);
     }
 
     public static class PublicKeys {
@@ -244,6 +267,7 @@ public class MimsConnect {
     private final String ENDPOINT_UPDATE_DISPLAY_STATUS = "set_display_status";
     private final String ENDPOINT_UPDATE_DISPLAY_ICON = "set_display_icon";
     private final String ENDPOINT_REQUEST_USER_INFO = "request_public_info";
+    private final String ENDPOINT_REQUEST_NAME_AVAILABILITY = "check_username_availability";
 
 
     /* Key names for keystore retrieval */
@@ -257,6 +281,7 @@ public class MimsConnect {
     private List<ChatServiceEventListener> chatServiceEventListeners = new ArrayList<>();
     private List<UserInfoUpdateListener> userInfoUpdateEventListeners = new ArrayList<>();
     private List<UserInfoRetrieveListener> userInfoRetrieveEventListeners = new ArrayList<>();
+    private List<UsernameCheckListener> usernameCheckListeners = new ArrayList<>();
 
     /* User information */
     private String uuid = null;
@@ -777,7 +802,9 @@ public class MimsConnect {
                         String messageContent = message.getString("message");
                         String b64AesKey = message.getString("aes_key_encrypted");
                         String rsaSig = message.getString("rsa_sig");
-                        onDecryptMessage(senderUuid, messageContent, b64AesKey, rsaSig);
+                        double time = message.getDouble("timestamp");
+                        Date timeSent = new Date((long) (time * 1000));
+                        onDecryptMessage(senderUuid, messageContent, b64AesKey, rsaSig, timeSent);
                     } catch (JSONException e) {
                         Log.e(TAG, "Unable to parse message, skipping...");
                     }
@@ -790,6 +817,44 @@ public class MimsConnect {
         return true;
     }
 
+    public void checkUsernameAvailability(final String username) {
+        StringRequest req = new StringRequest(
+                Request.Method.POST, apiUri.resolve(ENDPOINT_REQUEST_NAME_AVAILABILITY).toString(),
+                new Response.Listener<String>() {
+                    @Override
+                    public void onResponse(String responseStr) {
+                        try {
+                            JSONObject response = new JSONObject(responseStr);
+                            if (response.getBoolean("successful")) {
+                                if (response.getBoolean("message")) {
+                                    onNameAvailable(username);
+                                } else {
+                                    onNameUsed(username);
+                                }
+                            } else {
+                                onNameCheckError(username, new RuntimeException("Server rejected request"));
+                            }
+                        } catch (JSONException e) {
+                            Log.e(TAG, "Error parsing response", e);
+                            onNameCheckError(username, e);
+                        }
+                    }
+                }, new Response.ErrorListener() {
+            @Override
+            public void onErrorResponse(VolleyError error) {
+                onNameCheckError(username, error);
+            }
+        }) {
+            @Override
+            protected Map<String, String> getParams() {
+                Map<String, String> params = new HashMap<>();
+                params.put("username", username);
+                return params;
+            }
+        };
+        requestQueue.add(req);
+    }
+
     /**
      * Gets the uuid of the current user. Null if current user has no uuid registered
      *
@@ -800,7 +865,7 @@ public class MimsConnect {
     }
 
     private void onDecryptMessage(final String senderUuid, final String message, final String b64AesKey,
-                                  final String rsaSig) {
+                                  final String rsaSig, final Date timeSent) {
         threadPool.submit(new Runnable() {
             @Override
             public void run() {
@@ -829,7 +894,7 @@ public class MimsConnect {
                             decryptWithKey(aesKey, fromBase64(message)),
                             StandardCharsets.UTF_8
                     );
-                    onReceiveMessage(senderUuid, messageDecrypted);
+                    onReceiveMessage(senderUuid, messageDecrypted, timeSent);
                 } catch (NoSuchPaddingException | InvalidKeyException | NoSuchAlgorithmException
                         | InvalidAlgorithmParameterException | BadPaddingException | IllegalBlockSizeException
                         | SignatureException e) {
@@ -1446,6 +1511,10 @@ public class MimsConnect {
         userInfoRetrieveEventListeners.add(listener);
     }
 
+    public void addListener(UsernameCheckListener listener) {
+        usernameCheckListeners.add(listener);
+    }
+
     public void removeListener(RegisterEventListener listener) {
         registerEventListeners.remove(listener);
     }
@@ -1468,6 +1537,10 @@ public class MimsConnect {
 
     public void removeListener(UserInfoRetrieveListener listener) {
         userInfoRetrieveEventListeners.remove(listener);
+    }
+
+    public void removeListener(UsernameCheckListener listener) {
+        usernameCheckListeners.remove(listener);
     }
 
     private void onRegisterSuccessful(String uuid) {
@@ -1524,9 +1597,9 @@ public class MimsConnect {
         }
     }
 
-    private void onReceiveMessage(String senderUuid, String message) {
+    private void onReceiveMessage(String senderUuid, String message, Date timeSent) {
         for (ChatServiceEventListener listener : chatServiceEventListeners) {
-            listener.onMessageReceive(senderUuid, message);
+            listener.onMessageReceive(senderUuid, message, timeSent);
         }
     }
 
@@ -1575,6 +1648,24 @@ public class MimsConnect {
     private void onUserInfoRetrieveFailed(String targetUuid, Exception e) {
         for (UserInfoRetrieveListener listener : userInfoRetrieveEventListeners) {
             listener.onFailure(targetUuid, e);
+        }
+    }
+
+    private void onNameAvailable(String username) {
+        for (UsernameCheckListener listener : usernameCheckListeners) {
+            listener.onAvailable(username);
+        }
+    }
+
+    private void onNameUsed(String username) {
+        for (UsernameCheckListener listener : usernameCheckListeners) {
+            listener.onUsed(username);
+        }
+    }
+
+    private void onNameCheckError(String username, Exception e) {
+        for (UsernameCheckListener listener : usernameCheckListeners) {
+            listener.onError(username, e);
         }
     }
 }
