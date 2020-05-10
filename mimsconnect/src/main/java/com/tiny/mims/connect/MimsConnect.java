@@ -178,7 +178,7 @@ public class MimsConnect {
     }
 
     /**
-     * Event handler for retrieving user info
+     * Event handler for checking username
      */
     public interface UsernameCheckListener {
         /**
@@ -197,6 +197,28 @@ public class MimsConnect {
 
         /** Called when retrieval is failed */
         void onError(String username, Exception e);
+    }
+
+    /**
+     * Event handler for checking uuid
+     */
+    public interface UuidCheckListener {
+        /**
+         * Called when uuid exist
+         *
+         * @param uuid The requested username
+         */
+        void onExist(String uuid);
+
+        /**
+         * Called when uuid does not exist
+         *
+         * @param uuid The requested username
+         */
+        void onNotExisted(String uuid);
+
+        /** Called when retrieval is failed */
+        void onError(String uuid, Exception e);
     }
 
     public static class PublicKeys {
@@ -268,7 +290,7 @@ public class MimsConnect {
     private final String ENDPOINT_UPDATE_DISPLAY_ICON = "set_display_icon";
     private final String ENDPOINT_REQUEST_USER_INFO = "request_public_info";
     private final String ENDPOINT_REQUEST_NAME_AVAILABILITY = "check_username_availability";
-
+    private final String ENDPOINT_CHECK_UUID_EXIST = "check_uuid_exist";
 
     /* Key names for keystore retrieval */
     private final String KEY_ALIAS_ENC = "KEY_ALIAS_ENC";
@@ -282,6 +304,7 @@ public class MimsConnect {
     private List<UserInfoUpdateListener> userInfoUpdateEventListeners = new ArrayList<>();
     private List<UserInfoRetrieveListener> userInfoRetrieveEventListeners = new ArrayList<>();
     private List<UsernameCheckListener> usernameCheckListeners = new ArrayList<>();
+    private List<UuidCheckListener> uuidCheckListeners = new ArrayList<>();
 
     /* User information */
     private String uuid = null;
@@ -849,6 +872,44 @@ public class MimsConnect {
             protected Map<String, String> getParams() {
                 Map<String, String> params = new HashMap<>();
                 params.put("username", username);
+                return params;
+            }
+        };
+        requestQueue.add(req);
+    }
+
+    public void checkUUid(final String uuid) {
+        StringRequest req = new StringRequest(
+                Request.Method.POST, apiUri.resolve(ENDPOINT_CHECK_UUID_EXIST).toString(),
+                new Response.Listener<String>() {
+                    @Override
+                    public void onResponse(String responseStr) {
+                        try {
+                            JSONObject response = new JSONObject(responseStr);
+                            if (response.getBoolean("successful")) {
+                                if (response.getBoolean("message")) {
+                                    onUuidExist(uuid);
+                                } else {
+                                    onUuidNotExist(uuid);
+                                }
+                            } else {
+                                onUuidCheckError(uuid, new RuntimeException("Server rejected request"));
+                            }
+                        } catch (JSONException e) {
+                            Log.e(TAG, "Error parsing response", e);
+                            onUuidCheckError(uuid, e);
+                        }
+                    }
+                }, new Response.ErrorListener() {
+            @Override
+            public void onErrorResponse(VolleyError error) {
+                onUuidCheckError(uuid, error);
+            }
+        }) {
+            @Override
+            protected Map<String, String> getParams() {
+                Map<String, String> params = new HashMap<>();
+                params.put("uuid", uuid);
                 return params;
             }
         };
@@ -1515,6 +1576,10 @@ public class MimsConnect {
         usernameCheckListeners.add(listener);
     }
 
+    public void addListener(UuidCheckListener listener) {
+        uuidCheckListeners.add(listener);
+    }
+
     public void removeListener(RegisterEventListener listener) {
         registerEventListeners.remove(listener);
     }
@@ -1541,6 +1606,10 @@ public class MimsConnect {
 
     public void removeListener(UsernameCheckListener listener) {
         usernameCheckListeners.remove(listener);
+    }
+
+    public void removeListener(UuidCheckListener listener) {
+        uuidCheckListeners.remove(listener);
     }
 
     private void onRegisterSuccessful(String uuid) {
@@ -1663,9 +1732,27 @@ public class MimsConnect {
         }
     }
 
+    private void onUuidExist(String uuid) {
+        for (UuidCheckListener listener : uuidCheckListeners) {
+            listener.onExist(uuid);
+        }
+    }
+
+    private void onUuidNotExist(String uuid) {
+        for (UuidCheckListener listener : uuidCheckListeners) {
+            listener.onNotExisted(uuid);
+        }
+    }
+
     private void onNameCheckError(String username, Exception e) {
         for (UsernameCheckListener listener : usernameCheckListeners) {
             listener.onError(username, e);
+        }
+    }
+
+    private void onUuidCheckError(String uuid, Exception e) {
+        for (UuidCheckListener listener : uuidCheckListeners) {
+            listener.onError(uuid, e);
         }
     }
 }
