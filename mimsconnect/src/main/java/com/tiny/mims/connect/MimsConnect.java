@@ -144,6 +144,7 @@ public class MimsConnect {
     public interface UserInfoUpdateListener {
         String TYPE_DISPLAY_NAME = "display_name";
         String TYPE_DISPLAY_STATUS = "display_status";
+        String TYPE_ICON = "display_icon";
 
         /**
          * Called when update is successful
@@ -719,6 +720,66 @@ public class MimsConnect {
                         Map<String, String> params = new HashMap<>();
                         params.put("uuid", uuid);
                         params.put("display_status", displayStatus);
+                        params.put("rsa_sig", rsaSig);
+                        return params;
+                    }
+                };
+                requestQueue.add(req);
+            }
+        });
+    }
+
+    /**
+     * Updates the user display status
+     *
+     * @param icon The icon to replace
+     */
+    public void updateUserIcon(final byte[] icon) {
+        threadPool.submit(new Runnable() {
+            @Override
+            public void run() {
+                final String iconB64 = toBase64(icon);
+                final String rsaSig;
+                try {
+                    rsaSig = getSignature(
+                            new String[]{uuid, iconB64},
+                            getPrivateKeyFromKeystore(KEY_ALIAS_SIGN)
+                    );
+                } catch (NoSuchAlgorithmException | InvalidKeyException | SignatureException e) {
+                    onUserInfoUpdateFailed(UserInfoUpdateListener.TYPE_ICON, e);
+                    return;
+                }
+                StringRequest req = new StringRequest(
+                        Request.Method.POST, apiUri.resolve(ENDPOINT_UPDATE_DISPLAY_ICON).toString(),
+                        new Response.Listener<String>() {
+                            @Override
+                            public void onResponse(String responseStr) {
+                                try {
+                                    JSONObject response = new JSONObject(responseStr);
+                                    if (response.getBoolean("successful")) {
+                                        onUserInfoUpdateSuccess(UserInfoUpdateListener.TYPE_ICON);
+                                    } else {
+                                        onUserInfoUpdateFailed(
+                                                UserInfoUpdateListener.TYPE_ICON,
+                                                new RuntimeException("Server rejected the request")
+                                        );
+                                    }
+                                } catch (JSONException e) {
+                                    Log.e(TAG, "Error parsing response", e);
+                                    onUserInfoUpdateFailed(UserInfoUpdateListener.TYPE_ICON, e);
+                                }
+                            }
+                        }, new Response.ErrorListener() {
+                    @Override
+                    public void onErrorResponse(VolleyError error) {
+                        onUserInfoUpdateFailed(UserInfoUpdateListener.TYPE_ICON, error);
+                    }
+                }) {
+                    @Override
+                    protected Map<String, String> getParams() {
+                        Map<String, String> params = new HashMap<>();
+                        params.put("uuid", uuid);
+                        params.put("display_icon", iconB64);
                         params.put("rsa_sig", rsaSig);
                         return params;
                     }
