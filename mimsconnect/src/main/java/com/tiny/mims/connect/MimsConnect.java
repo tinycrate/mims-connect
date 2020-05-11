@@ -908,6 +908,20 @@ public class MimsConnect {
         return true;
     }
 
+    /**
+     * Disconnect from chat services
+     *
+     * @return True if the request is successful
+     */
+    public boolean disconnectFromChatService() {
+        if (socketIoClient != null) {
+            socketIoClient.close();
+            socketIoClient = null;
+            return true;
+        }
+        return false;
+    }
+
     public void checkUsernameAvailability(final String username) {
         StringRequest req = new StringRequest(
                 Request.Method.POST, apiUri.resolve(ENDPOINT_REQUEST_NAME_AVAILABILITY).toString(),
