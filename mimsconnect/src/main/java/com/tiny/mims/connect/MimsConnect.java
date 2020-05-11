@@ -263,6 +263,13 @@ public class MimsConnect {
         public String getDisplayIconB64() {
             return displayIconB64;
         }
+
+        /**
+         * @return Display icon in bytes
+         */
+        public byte[] getDisplayIcon() {
+            return fromBase64(displayIconB64);
+        }
     }
 
     private final String TAG = "MimsConnect";
